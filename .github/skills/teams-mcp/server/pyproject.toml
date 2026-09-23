@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teams-mcp"
+version = "0.1.0"
+description = "MCP server for reading, triaging and replying to Microsoft Teams chats."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp>=1.12.0,<2",
+  "httpx>=0.28.1",
+  "truststore>=0.10.0"
+]
+
+[project.optional-dependencies]
+graph = [
+  "msal>=1.31.0"
+]
+test = [
+  "pytest>=8.3.0"
+]
+
+[project.scripts]
+teams-mcp = "teams_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

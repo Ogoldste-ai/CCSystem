@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "outlook-mcp"
+version = "0.1.0"
+description = "MCP server for reading, searching and sending Microsoft Outlook mail via local COM."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp>=1.12.0,<2",
+  "pywin32>=306; sys_platform == 'win32'"
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3.0"
+]
+
+[project.scripts]
+outlook-mcp = "outlook_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

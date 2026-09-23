@@ -1,3 +1,6 @@
 [submodule "ec_accurev_git"]
 	path = ec_accurev_git
 	url = git@gitlab2.nuvoton.co.il:validation/ec_accurev_git.git
+[submodule "copilot-marketplace"]
+	path = copilot-marketplace
+	url = git@github:Ogoldste-ai/copilot-marketplace.git

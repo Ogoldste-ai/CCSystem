@@ -1,0 +1,3 @@
+[submodule "ec_accurev_git"]
+	path = ec_accurev_git
+	url = git@gitlab2.nuvoton.co.il:validation/ec_accurev_git.git

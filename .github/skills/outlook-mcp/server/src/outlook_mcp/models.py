@@ -116,3 +116,75 @@ class MailMessage:
             data["body_truncated"] = True
             data["hint"] = "Preview only. Call get_message(entry_id) for the full body."
         return data
+
+
+@dataclass(slots=True)
+class CalendarEvent:
+    """One appointment, normalised away from COM's awkward surface.
+
+    Kept separate from ``MailMessage`` rather than bolted onto it: an
+    appointment has no sender, no read state and no conversation, and three
+    quarters of the mail fields would be permanently empty.
+    """
+
+    entry_id: str = ""
+    subject: str = ""
+    start: str = ""
+    end: str = ""
+    duration_minutes: int = 0
+    organizer: str = ""
+    required: list[str] = field(default_factory=list)
+    optional: list[str] = field(default_factory=list)
+    location: str = ""
+    categories: list[str] = field(default_factory=list)
+    is_recurring: bool = False
+    busy_status: str = "busy"
+    all_day: bool = False
+    preview: str = ""
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any], preview_chars: int = 400) -> "CalendarEvent":
+        body_raw = str(raw.get("body") or "")
+        preview, _ = preview_of(body_raw, bool(raw.get("is_html")), preview_chars)
+        return cls(
+            entry_id=str(raw.get("entry_id") or ""),
+            subject=str(raw.get("subject") or "(no subject)"),
+            start=str(raw.get("start") or ""),
+            end=str(raw.get("end") or ""),
+            duration_minutes=int(raw.get("duration_minutes") or 0),
+            organizer=str(raw.get("organizer") or ""),
+            required=list(raw.get("required") or []),
+            optional=list(raw.get("optional") or []),
+            location=str(raw.get("location") or ""),
+            categories=list(raw.get("categories") or []),
+            is_recurring=bool(raw.get("is_recurring")),
+            busy_status=str(raw.get("busy_status") or "busy"),
+            all_day=bool(raw.get("all_day")),
+            preview=preview,
+        )
+
+    def to_dict(self, max_recipients: int = 0) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "entry_id": self.entry_id,
+            "subject": self.subject,
+            "start": self.start,
+            "end": self.end,
+            "duration_minutes": self.duration_minutes,
+            "organizer": self.organizer,
+            "busy_status": self.busy_status,
+        }
+        if self.required:
+            data["required"] = cap_recipients(self.required, max_recipients)
+        if self.optional:
+            data["optional"] = cap_recipients(self.optional, max_recipients)
+        if self.location:
+            data["location"] = self.location
+        if self.categories:
+            data["categories"] = self.categories
+        if self.is_recurring:
+            data["is_recurring"] = True
+        if self.all_day:
+            data["all_day"] = True
+        if self.preview:
+            data["preview"] = self.preview
+        return data

@@ -10,9 +10,11 @@ from .formatting import split_addresses
 OL_FOLDER_INBOX = 6
 OL_FOLDER_SENT = 5
 OL_FOLDER_DRAFTS = 16
+OL_FOLDER_CALENDAR = 9
 
 OL_TO, OL_CC, OL_BCC = 1, 2, 3
 OL_MAIL_ITEM = 43
+OL_APPOINTMENT_ITEM = 26
 
 # PR_SENT_REPRESENTING_SMTP_ADDRESS. Exchange hands back an X500 DN from
 # SenderEmailAddress, which is useless for replying, so read the SMTP property
@@ -21,6 +23,12 @@ PR_SENDER_SMTP = "http://schemas.microsoft.com/mapi/proptag/0x5D01001E"
 PR_RECIPIENT_SMTP = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 
 IMPORTANCE = {0: "low", 1: "normal", 2: "high"}
+
+# OlBusyStatus. "free" is what a declined-but-kept or informational block looks
+# like, so it is worth distinguishing from a meeting that actually cost time.
+BUSY_STATUS = {0: "free", 1: "tentative", 2: "busy", 3: "out_of_office", 4: "working_elsewhere"}
+
+OL_REQUIRED, OL_OPTIONAL = 1, 2
 
 _com_state = threading.local()
 
@@ -53,6 +61,20 @@ def _safe(getter, default=None):
     try:
         return getter()
     except Exception:
+        return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    """Coerce a COM numeric property, preserving a legitimate zero.
+
+    ``int(x or default)`` is the obvious spelling and is wrong: enum values
+    like olFree are 0, which is falsy, so the default silently wins.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return default
 
 
@@ -278,6 +300,129 @@ class OutlookClient:
             "is_html": use_html,
         }
 
+    # ---------------------------------------------------------------- calendar
+
+    def _attendees(self, item: Any) -> tuple[list[str], list[str]]:
+        """Split an appointment's recipients into required and optional."""
+        required: list[str] = []
+        optional: list[str] = []
+        recipients = _safe(lambda: item.Recipients)
+        count = int(_safe(lambda: recipients.Count, 0) or 0) if recipients else 0
+        for index in range(1, count + 1):
+            recipient = _safe(lambda i=index: recipients.Item(i))
+            if recipient is None:
+                continue
+            label = str(_safe(lambda r=recipient: r.Name, "") or "")
+            if not label:
+                continue
+            kind = int(_safe(lambda r=recipient: r.Type, OL_REQUIRED) or OL_REQUIRED)
+            (optional if kind == OL_OPTIONAL else required).append(label)
+        if not required and not optional:
+            required = split_addresses(str(_safe(lambda: item.RequiredAttendees, "") or ""))
+            optional = split_addresses(str(_safe(lambda: item.OptionalAttendees, "") or ""))
+        return required, optional
+
+    def event_to_raw(self, item: Any) -> dict[str, Any]:
+        html_body = _safe(lambda: item.HTMLBody, "") or ""
+        plain_body = _safe(lambda: item.Body, "") or ""
+        use_html = bool(html_body) and not plain_body
+        required, optional = self._attendees(item)
+        categories = [
+            part.strip()
+            for part in str(_safe(lambda: item.Categories, "") or "").split(",")
+            if part.strip()
+        ]
+        return {
+            "entry_id": str(_safe(lambda: item.EntryID, "") or ""),
+            "subject": str(_safe(lambda: item.Subject, "") or ""),
+            "start": _to_iso(_safe(lambda: item.Start)),
+            "end": _to_iso(_safe(lambda: item.End)),
+            "duration_minutes": _as_int(_safe(lambda: item.Duration), 0),
+            "organizer": str(_safe(lambda: item.Organizer, "") or ""),
+            "required": required,
+            "optional": optional,
+            "location": str(_safe(lambda: item.Location, "") or ""),
+            "categories": categories,
+            "is_recurring": bool(_safe(lambda: item.IsRecurring, False)),
+            # Not `... or 2`: olFree is 0, and `0 or 2` would silently relabel
+            # every free block as busy.
+            "busy_status": BUSY_STATUS.get(
+                _as_int(_safe(lambda: item.BusyStatus), 2), "busy"
+            ),
+            "all_day": bool(_safe(lambda: item.AllDayEvent, False)),
+            "body": html_body if use_html else plain_body,
+            "is_html": use_html,
+        }
+
+    def list_events(
+        self,
+        days_back: int = 7,
+        days_forward: int = 0,
+        limit: int = 50,
+        include_all_day: bool = True,
+        busy_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List calendar appointments in a window around today, earliest first.
+
+        Recurring meetings are the whole point of a work calendar and they are
+        also the easy thing to get wrong: Outlook stores one master item per
+        series, so unless ``IncludeRecurrences`` is set *and* the collection is
+        sorted by ``[Start]`` **before** ``Restrict`` is applied, every weekly
+        standup silently vanishes from the result.
+
+        ``busy_only`` drops only free blocks, which is what cancelled meetings
+        report as. Tentative is deliberately kept: see the comment below.
+        """
+        folder = _safe(lambda: self.namespace.GetDefaultFolder(OL_FOLDER_CALENDAR))
+        if folder is None:
+            raise OutlookUnavailableError("Could not open the default Calendar folder.")
+        items = folder.Items
+        _safe(lambda: setattr(items, "IncludeRecurrences", True))
+        _safe(lambda: items.Sort("[Start]"))
+
+        start = datetime.now() - timedelta(days=max(0, days_back))
+        end = datetime.now() + timedelta(days=max(0, days_forward) + 1)
+        # Outlook's Restrict parser wants US-style dates regardless of locale.
+        low = start.strftime("%m/%d/%Y %I:%M %p")
+        high = end.strftime("%m/%d/%Y %I:%M %p")
+        items = _safe(
+            lambda: items.Restrict(f"[Start] >= '{low}' AND [Start] <= '{high}'"),
+            items,
+        )
+
+        out: list[dict[str, Any]] = []
+        # Bounded scan, same reasoning as list_raw: a calendar with years of
+        # history must not turn one tool call into a full-store walk.
+        scan_cap = max(limit * 20, 200)
+        count = int(_safe(lambda: items.Count, 0) or 0)
+        for index in range(1, min(count, scan_cap) + 1):
+            if len(out) >= limit:
+                break
+            item = _safe(lambda i=index: items.Item(i))
+            if item is None:
+                continue
+            # Default 0 so an item whose Class read fails is skipped rather
+            # than emitted with every field blank.
+            if int(_safe(lambda: item.Class, 0) or 0) != OL_APPOINTMENT_ITEM:
+                continue
+            if not str(_safe(lambda: item.EntryID, "") or "").strip():
+                continue
+            raw = _safe(lambda i=item: self.event_to_raw(i))
+            if not raw:
+                continue
+            if not include_all_day and raw.get("all_day"):
+                continue
+            # Only "free" is dropped, never "tentative". In a real mailbox
+            # tentative is the resting state of a perfectly normal accepted
+            # meeting - people rarely click Accept - whereas cancelled
+            # meetings reliably come back as free. Filtering tentative here
+            # silently threw away most of the working week.
+            if busy_only and raw.get("busy_status") == "free":
+                continue
+            out.append(raw)
+        out.sort(key=lambda raw: str(raw.get("start") or ""))
+        return out
+
     def list_raw(
         self,
         folder_path: str = "",
@@ -441,6 +586,7 @@ class OutlookClient:
         body: str,
         reply_all: bool = False,
         send: bool = False,
+        subject: str = "",
     ) -> dict[str, Any]:
         item = _safe(lambda: self.namespace.GetItemFromID(entry_id))
         if item is None:
@@ -448,6 +594,10 @@ class OutlookClient:
         draft = item.ReplyAll() if reply_all else item.Reply()
         # Prepend so Outlook's quoted original stays underneath, as in a normal reply.
         draft.Body = body + "\n\n" + str(_safe(lambda: draft.Body, "") or "")
+        # Outlook forces "RE: <original>", which is wrong for a rolling series
+        # like a weekly report where the subject carries a changing week number.
+        if subject.strip():
+            draft.Subject = subject.strip()
         if send:
             draft.Send()
             return {

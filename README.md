@@ -10,6 +10,7 @@ repo so it can be versioned independently.
                     gitlab-mcp/   outlook-mcp/   teams-mcp/
                     Shared-Module-Host-convert-to-param/
                     shared-module-convert-test-and-parm/
+                    weekly-mail/  (weekly WW status mail drafter)
 .github/agents/   (reserved) custom agent definitions
 ec_accurev_git/   git submodule → firmware repo (added separately)
 ```

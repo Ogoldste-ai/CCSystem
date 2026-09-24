@@ -6,7 +6,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .config import OutlookConfig
-from .models import MailMessage
+from .models import CalendarEvent, MailMessage
 from .outlook import OutlookClient
 
 
@@ -204,6 +204,35 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
         )
 
     @server.tool()
+    def list_calendar_events(
+        days_back: int = 7,
+        days_forward: int = 0,
+        limit: int = 50,
+        include_all_day: bool = True,
+        busy_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List calendar appointments around today, earliest first.
+
+        Defaults to the last 7 days, which is what "what did I actually do
+        this week" needs. Recurring meetings are expanded into their
+        individual occurrences. Set `busy_only=True` to drop free and
+        tentative blocks and keep only meetings that really cost time.
+        """
+        raws = client.list_events(
+            days_back=max(0, int(days_back or 0)),
+            days_forward=max(0, int(days_forward or 0)),
+            limit=_cap(limit),
+            include_all_day=include_all_day,
+            busy_only=busy_only,
+        )
+        return [
+            CalendarEvent.from_raw(raw, preview_chars=config.preview_chars).to_dict(
+                max_recipients=config.list_recipients
+            )
+            for raw in raws
+        ]
+
+    @server.tool()
     def mark_read(entry_id: str, read: bool = True) -> dict[str, Any]:
         """Mark a message read or unread. Requires OUTLOOK_ALLOW_WRITE=1."""
         config.require_write()
@@ -247,13 +276,21 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
 
     @server.tool()
     def reply_to_message(
-        entry_id: str, body: str, reply_all: bool = False, send: bool = False
+        entry_id: str,
+        body: str,
+        reply_all: bool = False,
+        send: bool = False,
+        subject: str = "",
     ) -> dict[str, Any]:
         """Reply to a message, saving a draft by default.
 
         With send=False (the default) the reply is left in Drafts for you to
         review. send=True dispatches it immediately and requires
         OUTLOOK_ALLOW_WRITE=1; confirm the wording first, as it cannot be unsent.
+
+        `subject` overrides Outlook's automatic "RE: <original>". Leave it empty
+        for a normal reply; set it for a rolling series whose subject changes
+        each time, such as a weekly report with a week number in it.
         """
         if not entry_id.strip():
             raise ValueError("entry_id is required.")
@@ -262,7 +299,11 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
         if send:
             config.require_send()
         return client.reply(
-            entry_id=entry_id.strip(), body=body, reply_all=reply_all, send=send
+            entry_id=entry_id.strip(),
+            body=body,
+            reply_all=reply_all,
+            send=send,
+            subject=subject,
         )
 
     return server

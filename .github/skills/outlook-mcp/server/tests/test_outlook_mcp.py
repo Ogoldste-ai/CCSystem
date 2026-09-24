@@ -120,6 +120,47 @@ class FakeMail:
         return draft
 
 
+class FakeAppointment:
+    Class = 26
+
+    def __init__(
+        self,
+        entry_id,
+        subject,
+        start,
+        duration=60,
+        organizer="Oren Goldstein",
+        required=(),
+        optional=(),
+        location="",
+        categories="",
+        is_recurring=False,
+        busy_status=2,
+        all_day=False,
+        body="",
+    ):
+        self.EntryID = entry_id
+        self.Subject = subject
+        self.Start = start
+        self.End = start + timedelta(minutes=duration)
+        self.Duration = duration
+        self.Organizer = organizer
+        self.Location = location
+        self.Categories = categories
+        self.IsRecurring = is_recurring
+        self.BusyStatus = busy_status
+        self.AllDayEvent = all_day
+        self.Body = body
+        self.HTMLBody = ""
+        self.RequiredAttendees = ""
+        self.OptionalAttendees = ""
+        self.Recipients = FakeCollection(
+            [FakeRecipient(n, f"{n.lower()}@nuvoton.com", 1) for n in required]
+            + [FakeRecipient(n, f"{n.lower()}@nuvoton.com", 2) for n in optional]
+        )
+        self.Parent = None
+
+
 class FakeItems:
     def __init__(self, items):
         self._items = list(items)
@@ -127,6 +168,10 @@ class FakeItems:
         # inherit a previously applied Sort. Model that from the unsorted
         # original, or the sort-before-restrict bug is invisible in tests.
         self._original = list(items)
+        # Outlook only expands a recurring series when this is set. Default
+        # False so a client that forgets to set it sees only masters, exactly
+        # as it would against the real object model.
+        self.IncludeRecurrences = False
 
     @property
     def Count(self):
@@ -136,12 +181,25 @@ class FakeItems:
         return self._items[index - 1]
 
     def Sort(self, field, descending=False):
-        self._items.sort(key=lambda m: m.ReceivedTime, reverse=descending)
+        key = (
+            (lambda m: m.Start)
+            if "Start" in str(field)
+            else (lambda m: m.ReceivedTime)
+        )
+        self._items.sort(key=key, reverse=descending)
 
     def Restrict(self, query):
         if "UnRead" in query:
             return FakeItems([m for m in self._original if m.UnRead])
-        return FakeItems(self._original)
+        out = FakeItems(self._original)
+        # Restrict returns a new collection, but the recurrence setting is a
+        # property of the *source* collection and its effect carries into the
+        # restricted result. Propagate it so a client that sets the flag after
+        # restricting is correctly shown as broken.
+        out.IncludeRecurrences = self.IncludeRecurrences
+        if not out.IncludeRecurrences:
+            out._items = [m for m in out._items if not getattr(m, "IsRecurring", False)]
+        return out
 
 
 class FakeFolder:
@@ -233,10 +291,51 @@ def build_client(allow_write=False, allow_send=True, preview_chars=400):
     sub = FakeFolder("Projects", items=[FakeMail("id-3", "Spec review")])
     inbox = FakeFolder("Inbox", items=inbox_items, children=[sub])
     sent = FakeFolder("Sent Items", items=[FakeMail("id-4", "Re: Spec review")])
+    calendar_items = [
+        FakeAppointment(
+            "appt-1",
+            "EC I3C design review",
+            datetime.now() - timedelta(days=2),
+            duration=90,
+            required=["Itamar"],
+            optional=["Shir"],
+            location="Room 4",
+            categories="EC, Review",
+            body="Walk through the I3C host changes.",
+        ),
+        FakeAppointment(
+            "appt-2",
+            "Weekly team standup",
+            datetime.now() - timedelta(days=1),
+            duration=30,
+            is_recurring=True,
+        ),
+        FakeAppointment(
+            "appt-3",
+            "Focus block",
+            datetime.now() - timedelta(days=3),
+            duration=120,
+            busy_status=0,
+        ),
+        FakeAppointment(
+            "appt-4",
+            "Company holiday",
+            datetime.now() - timedelta(days=4),
+            all_day=True,
+        ),
+        FakeAppointment(
+            "appt-5",
+            "Tentative design sync",
+            datetime.now() - timedelta(days=2),
+            duration=45,
+            busy_status=1,
+        ),
+    ]
+    calendar = FakeFolder("Calendar", items=calendar_items)
     root = FakeFolder("me@nuvoton.com", children=[inbox, sent])
     namespace = FakeNamespace(
         [root],
-        defaults={6: inbox, 5: sent, 16: FakeFolder("Drafts")},
+        defaults={6: inbox, 5: sent, 16: FakeFolder("Drafts"), 9: calendar},
         by_id={item.EntryID: item for item in inbox_items},
     )
     app = FakeApp(namespace)
@@ -707,6 +806,121 @@ def test_mark_read_updates_and_saves():
     assert client.mark_read("id-1")["unread"] is False
 
 
+# ------------------------------------------------------- reply subject override
+
+
+def test_reply_keeps_outlooks_subject_by_default():
+    client, _, ns = build_client()
+    result = client.reply("id-1", "x", reply_all=True)
+    assert result["subject"] == "RE: Build broke on master"
+
+
+def test_reply_subject_override_replaces_the_re_prefix():
+    """The whole point: a rolling series needs a changing subject, not RE:."""
+    client, _, _ = build_client()
+    result = client.reply("id-1", "x", reply_all=True, subject="Weekly - WW40")
+    assert result["subject"] == "Weekly - WW40"
+
+
+def test_reply_subject_override_is_trimmed():
+    client, _, _ = build_client()
+    result = client.reply("id-1", "x", subject="  Weekly - WW41  ")
+    assert result["subject"] == "Weekly - WW41"
+
+
+def test_reply_blank_subject_does_not_wipe_the_subject():
+    client, _, _ = build_client()
+    result = client.reply("id-1", "x", subject="   ")
+    assert result["subject"] == "RE: Build broke on master"
+
+
+def test_reply_subject_override_survives_an_immediate_send():
+    client, _, _ = build_client()
+    result = client.reply("id-1", "x", send=True, subject="Weekly - WW42")
+    assert result["sent"] is True
+    assert result["subject"] == "Weekly - WW42"
+
+
+# -------------------------------------------------------------------- calendar
+
+
+def test_list_events_returns_appointments_earliest_first():
+    client, _, _ = build_client()
+    events = client.list_events(days_back=7)
+    starts = [e["start"] for e in events]
+    assert starts == sorted(starts)
+    assert {e["subject"] for e in events} >= {"EC I3C design review", "Focus block"}
+
+
+def test_list_events_includes_recurring_occurrences():
+    """Without IncludeRecurrences the weekly standup silently disappears."""
+    client, _, _ = build_client()
+    subjects = {e["subject"] for e in client.list_events(days_back=7)}
+    assert "Weekly team standup" in subjects
+
+
+def test_list_events_shapes_attendees_and_categories():
+    client, _, _ = build_client()
+    event = next(
+        e for e in client.list_events(days_back=7) if e["subject"] == "EC I3C design review"
+    )
+    assert event["required"] == ["Itamar"]
+    assert event["optional"] == ["Shir"]
+    assert event["categories"] == ["EC", "Review"]
+    assert event["location"] == "Room 4"
+    assert event["duration_minutes"] == 90
+
+
+def test_list_events_busy_only_drops_free_blocks():
+    client, _, _ = build_client()
+    subjects = {e["subject"] for e in client.list_events(days_back=7, busy_only=True)}
+    assert "Focus block" not in subjects
+    assert "EC I3C design review" in subjects
+
+
+def test_list_events_busy_only_keeps_tentative_meetings():
+    """Regression: real mailboxes leave accepted meetings marked tentative.
+
+    Filtering tentative alongside free discarded almost every genuine meeting
+    in the week, which is exactly the kind of silent emptiness a status mail
+    must not be built on.
+    """
+    client, _, _ = build_client()
+    subjects = {e["subject"] for e in client.list_events(days_back=7, busy_only=True)}
+    assert "Tentative design sync" in subjects
+
+
+def test_list_events_can_exclude_all_day_entries():
+    client, _, _ = build_client()
+    subjects = {
+        e["subject"] for e in client.list_events(days_back=7, include_all_day=False)
+    }
+    assert "Company holiday" not in subjects
+
+
+def test_list_events_respects_the_limit():
+    client, _, _ = build_client()
+    assert len(client.list_events(days_back=7, limit=2)) == 2
+
+
+def test_list_calendar_events_tool_shapes_output():
+    client, config, _ = build_client()
+    rows = tools_of(build_server(config, client))["list_calendar_events"]()
+    assert rows
+    row = rows[0]
+    assert "subject" in row and "start" in row and "busy_status" in row
+    # An appointment has no sender or read state; those mail-only fields must
+    # not leak into the calendar shape.
+    assert "unread" not in row and "from" not in row
+
+
+def test_list_calendar_events_tool_is_capped_by_max_results():
+    client, config, _ = build_client()
+    config.max_results = 1
+    rows = tools_of(build_server(config, client))["list_calendar_events"](limit=50)
+    assert len(rows) == 1
+
+
 # -------------------------------------------------------------- server tools
 
 
@@ -719,6 +933,7 @@ def test_expected_tools_are_registered():
         "list_messages",
         "get_message",
         "search_messages",
+        "list_calendar_events",
         "mark_read",
         "create_draft",
         "send_mail",

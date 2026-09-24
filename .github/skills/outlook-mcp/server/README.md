@@ -49,13 +49,21 @@ Read:
 - `list_messages(folder="Inbox", limit=25, unread_only=False, days=0, from_contains="", subject_contains="")`
 - `get_message(entry_id, include_quoted=False, body_offset=0)` - the only call that returns a full body
 - `search_messages(query, folder="Inbox", limit=25, days=0)` - substring over subject and sender
+- `list_calendar_events(days_back=7, days_forward=0, limit=50, include_all_day=True, busy_only=False)` -
+  appointments around today, earliest first; recurring meetings are expanded
+  into their occurrences. `busy_only=True` drops free blocks, which is what
+  cancelled meetings report as. Tentative is kept on purpose: an accepted
+  meeting frequently stays tentative, so filtering it would hide most of the
+  real week.
 
 Write:
 
 - `create_draft(to, subject, body, cc="", bcc="")` - **ungated**; a draft goes
   nowhere until you click Send in Outlook
-- `reply_to_message(entry_id, body, reply_all=False, send=False)` - drafts by
-  default; `send=True` needs `OUTLOOK_ALLOW_WRITE`
+- `reply_to_message(entry_id, body, reply_all=False, send=False, subject="")` - drafts by
+  default; `send=True` needs `OUTLOOK_ALLOW_WRITE`. `subject` overrides
+  Outlook's automatic `RE: <original>`, which a rolling series such as a
+  weekly report needs in order to advance its week number.
 - `send_mail(to, subject, body, cc="", bcc="")` - needs `OUTLOOK_ALLOW_WRITE`
 - `mark_read(entry_id, read=True)` - needs `OUTLOOK_ALLOW_WRITE`
 

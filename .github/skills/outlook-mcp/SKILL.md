@@ -14,6 +14,7 @@ Use this skill when you need to:
 - see what new or unread mail has arrived
 - find a message by sender, subject or folder
 - read one message in full before acting on it
+- see which meetings you attended or have coming up
 - draft a reply for review, or send mail directly
 
 ## Required environment
@@ -42,11 +43,12 @@ Read:
 - `list_messages(folder="Inbox", limit=25, unread_only=False, days=0, from_contains="", subject_contains="")`
 - `get_message(entry_id, include_quoted=False, body_offset=0)`
 - `search_messages(query, folder="Inbox", limit=25, days=0)`
+- `list_calendar_events(days_back=7, days_forward=0, limit=50, include_all_day=True, busy_only=False)`
 
 Write:
 
 - `create_draft(to, subject, body, cc="", bcc="")` - **ungated**, always safe
-- `reply_to_message(entry_id, body, reply_all=False, send=False)`
+- `reply_to_message(entry_id, body, reply_all=False, send=False, subject="")`
 - `send_mail(to, subject, body, cc="", bcc="")` - requires `OUTLOOK_ALLOW_WRITE`
 - `mark_read(entry_id, read=True)` - requires `OUTLOOK_ALLOW_WRITE`
 
@@ -78,6 +80,14 @@ Write:
 
 ## Notes
 
+- Replying to a rolling series (a weekly report, a numbered status thread)
+  needs the `subject` argument: Outlook otherwise forces `RE: <original>`, so
+  the number in the subject never advances.
+- `list_calendar_events` expands recurring meetings into occurrences. Use
+  `busy_only=True` to drop free blocks, which is how cancelled meetings and
+  self-booked focus time report. **Tentative is deliberately kept** - an
+  accepted meeting often stays tentative, so excluding it would hide most of
+  a normal working week.
 - **This reads real work email.** Customer, HR, legal and personal content all
   live here, and anything a tool returns enters model context. Prefer targeted
   queries (`unread_only`, `days`, `from_contains`, a specific folder) over broad

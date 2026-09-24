@@ -215,8 +215,9 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
 
         Defaults to the last 7 days, which is what "what did I actually do
         this week" needs. Recurring meetings are expanded into their
-        individual occurrences. Set `busy_only=True` to drop free and
-        tentative blocks and keep only meetings that really cost time.
+        individual occurrences. Set `busy_only=True` to drop free blocks,
+        which is what cancelled meetings report as; tentative meetings are
+        kept, since an accepted meeting routinely stays tentative in Outlook.
         """
         raws = client.list_events(
             days_back=max(0, int(days_back or 0)),

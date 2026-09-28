@@ -4,3 +4,6 @@
 [submodule "copilot-marketplace"]
 	path = copilot-marketplace
 	url = git@github:Ogoldste-ai/copilot-marketplace.git
+[submodule "pdftomd-rag"]
+	path = pdftomd-rag
+	url = git@github-nuvoton:nuvoton-IS00/pdftomd-rag.git

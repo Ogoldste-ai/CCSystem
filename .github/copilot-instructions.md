@@ -36,6 +36,7 @@ repo that matches its purpose:
                     Shared-Module-Host-convert-to-param/
                     shared-module-convert-test-and-parm/
                     weekly-mail/  (weekly WW status mail drafter)
+                    hebrew-pdf-text-edit/  (edit text inside Hebrew PDFs)
 .github/agents/   Custom agent definitions (must live under .github/ for the
                   Copilot CLI to recognize them; reserved, populate as
                   agents mature)

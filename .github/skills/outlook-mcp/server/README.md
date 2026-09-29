@@ -55,6 +55,20 @@ Read:
   cancelled meetings report as. Tentative is kept on purpose: an accepted
   meeting frequently stays tentative, so filtering it would hide most of the
   real week.
+- `search_contacts(query, limit=10, include_gal=True)` - find a person's
+  address by name, alias or partial address. Looks in the Contacts folder
+  first, then the address book (GAL); `include_gal=False` stays local.
+
+  Two quirks of the real object model are handled here, and both are silent
+  data-loss bugs if they are not:
+
+  - The GAL resolves on **display name**, not alias - `eran.raz` fails where
+    `Eran Raz` succeeds - so the spaced spelling is tried too and `matched`
+    reports which one worked.
+  - Exchange-backed contacts put an unusable X500 DN in `Email1Address` and
+    the real address in `Email1DisplayName`. In a corporate mailbox that is
+    *every* saved contact, so the address is recovered from the display name,
+    and failing that from the directory.
 
 Write:
 

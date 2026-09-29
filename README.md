@@ -7,7 +7,7 @@ repo so it can be versioned independently.
 
 ```
 .github/skills/   Copilot skills, including bundled MCP servers:
-                    gitlab-mcp/   outlook-mcp/   teams-mcp/
+                    gitlab-mcp/   outlook-mcp/   teams-mcp/   teb-mcp/
                     Shared-Module-Host-convert-to-param/
                     shared-module-convert-test-and-parm/
                     weekly-mail/  (weekly WW status mail drafter)

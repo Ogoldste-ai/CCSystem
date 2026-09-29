@@ -44,6 +44,7 @@ Read:
 - `get_message(entry_id, include_quoted=False, body_offset=0)`
 - `search_messages(query, folder="Inbox", limit=25, days=0)`
 - `list_calendar_events(days_back=7, days_forward=0, limit=50, include_all_day=True, busy_only=False)`
+- `search_contacts(query, limit=10, include_gal=True)`
 
 Write:
 
@@ -88,6 +89,14 @@ Write:
   self-booked focus time report. **Tentative is deliberately kept** - an
   accepted meeting often stays tentative, so excluding it would hide most of
   a normal working week.
+- To find someone's address, use `search_contacts` - **not** a mail search.
+  Searching folders only finds people you have already corresponded with, so
+  a colleague you have never mailed looks like they do not exist.
+  `search_contacts` checks your Contacts folder and then the organisation's
+  address book (GAL).
+- The GAL matches on **display name**, not alias: `eran.raz` and `eran` both
+  fail where `Eran Raz` resolves. The tool tries the spaced spelling for you
+  and reports which one hit in `matched`.
 - **This reads real work email.** Customer, HR, legal and personal content all
   live here, and anything a tool returns enters model context. Prefer targeted
   queries (`unread_only`, `days`, `from_contains`, a specific folder) over broad

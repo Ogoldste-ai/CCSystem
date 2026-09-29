@@ -188,3 +188,71 @@ class CalendarEvent:
         if self.preview:
             data["preview"] = self.preview
         return data
+
+
+@dataclass(slots=True)
+class Contact:
+    """One person, from the Contacts folder or the address book.
+
+    Both sources are flattened into the same shape so a caller does not have to
+    branch on where the match came from - only `source` distinguishes them, and
+    that is informational.
+    """
+
+    entry_id: str = ""
+    name: str = ""
+    emails: list[str] = field(default_factory=list)
+    company: str = ""
+    job_title: str = ""
+    department: str = ""
+    office: str = ""
+    business_phone: str = ""
+    mobile_phone: str = ""
+    categories: list[str] = field(default_factory=list)
+    source: str = "contacts"
+    matched: str = ""
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> "Contact":
+        return cls(
+            entry_id=str(raw.get("entry_id") or ""),
+            name=str(raw.get("name") or "(no name)"),
+            emails=[str(e) for e in (raw.get("emails") or []) if e],
+            company=str(raw.get("company") or ""),
+            job_title=str(raw.get("job_title") or ""),
+            department=str(raw.get("department") or ""),
+            office=str(raw.get("office") or ""),
+            business_phone=str(raw.get("business_phone") or ""),
+            mobile_phone=str(raw.get("mobile_phone") or ""),
+            categories=list(raw.get("categories") or []),
+            source=str(raw.get("source") or "contacts"),
+            matched=str(raw.get("matched") or ""),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "name": self.name,
+            "emails": self.emails,
+            "source": self.source,
+        }
+        if self.entry_id:
+            data["entry_id"] = self.entry_id
+        for key in (
+            "company",
+            "job_title",
+            "department",
+            "office",
+            "business_phone",
+            "mobile_phone",
+        ):
+            value = getattr(self, key)
+            if value:
+                data[key] = value
+        if self.categories:
+            data["categories"] = self.categories
+        # Only interesting when it differs from what the caller typed, which is
+        # exactly the "you asked for the alias, the GAL wanted the display
+        # name" case worth surfacing.
+        if self.matched:
+            data["matched"] = self.matched
+        return data

@@ -24,7 +24,13 @@ from outlook_mcp.formatting import (  # noqa: E402
     truncate,
 )
 from outlook_mcp.models import MailMessage  # noqa: E402
-from outlook_mcp.outlook import PR_RECIPIENT_SMTP, PR_SENDER_SMTP, OutlookClient  # noqa: E402
+from outlook_mcp.outlook import (  # noqa: E402
+    PR_RECIPIENT_SMTP,
+    PR_SENDER_SMTP,
+    OutlookClient,
+    gal_probes,
+    smtp_from_display_name,
+)
 from outlook_mcp.server import build_server  # noqa: E402
 
 
@@ -161,6 +167,91 @@ class FakeAppointment:
         self.Parent = None
 
 
+class FakeContact:
+    Class = 40
+
+    def __init__(
+        self,
+        entry_id,
+        full_name,
+        email="",
+        email2="",
+        company="",
+        job_title="",
+        department="",
+        office="",
+        business_phone="",
+        mobile_phone="",
+        categories="",
+        email_display="",
+    ):
+        self.EntryID = entry_id
+        self.FullName = full_name
+        self.Email1Address = email
+        self.Email1DisplayName = email_display
+        self.Email2Address = email2
+        self.Email2DisplayName = ""
+        self.Email3Address = ""
+        self.Email3DisplayName = ""
+        self.CompanyName = company
+        self.JobTitle = job_title
+        self.Department = department
+        self.OfficeLocation = office
+        self.BusinessTelephoneNumber = business_phone
+        self.MobileTelephoneNumber = mobile_phone
+        self.Categories = categories
+        self.UnRead = False
+        self.Parent = None
+
+
+class FakeExchangeUser:
+    def __init__(self, name, smtp, job_title="", department="", office="", mobile="", company=""):
+        self.Name = name
+        self.PrimarySmtpAddress = smtp
+        self.JobTitle = job_title
+        self.Department = department
+        self.OfficeLocation = office
+        self.MobileTelephoneNumber = mobile
+        self.CompanyName = company
+
+
+class FakeAddressEntry:
+    def __init__(self, entry_id, name, address, user=None):
+        self.ID = entry_id
+        self.Name = name
+        self.Address = address
+        self._user = user
+
+    def GetExchangeUser(self):
+        if self._user is None:
+            raise RuntimeError("not an Exchange user")
+        return self._user
+
+
+class FakeRecipientResolver:
+    """Models Namespace.CreateRecipient(...).Resolve().
+
+    Directory lookups only succeed on the *display name*, which is the whole
+    reason `gal_probes` exists; the fake enforces that so the behaviour cannot
+    silently regress.
+    """
+
+    def __init__(self, name, directory):
+        self.Name = name
+        self._directory = directory
+        self.Resolved = False
+        self.AddressEntry = None
+
+    def Resolve(self):
+        hit = self._directory.get(self.Name.lower())
+        if hit is None:
+            return False
+        self.Resolved = True
+        self.AddressEntry = hit
+        self.Name = hit.Name
+        return True
+
+
 class FakeItems:
     def __init__(self, items):
         self._items = list(items)
@@ -227,11 +318,15 @@ class FakeFolder:
 
 
 class FakeNamespace:
-    def __init__(self, roots, defaults=None, by_id=None):
+    def __init__(self, roots, defaults=None, by_id=None, directory=None):
         self._roots = list(roots)
         self._defaults = defaults or {}
         self._by_id = by_id or {}
+        self._directory = directory or {}
         self.Accounts = FakeCollection([type("Acct", (), {"SmtpAddress": "me@nuvoton.com"})()])
+
+    def CreateRecipient(self, name):
+        return FakeRecipientResolver(name, self._directory)
 
     @property
     def Folders(self):
@@ -332,11 +427,73 @@ def build_client(allow_write=False, allow_send=True, preview_chars=400):
         ),
     ]
     calendar = FakeFolder("Calendar", items=calendar_items)
+    contact_items = [
+        FakeContact(
+            "contact-1",
+            "Itamar Tamir",
+            email="itamar.tamir@nuvoton.com",
+            company="Nuvoton",
+            job_title="FW Engineer",
+            mobile_phone="050-1111111",
+            categories="Work, EC",
+        ),
+        FakeContact(
+            "contact-2",
+            "Dana Levi",
+            email="dana.levi@example.com",
+            company="Example Ltd",
+        ),
+        FakeContact(
+            "contact-3",
+            "Legacy Exchange Person",
+            email="/O=NUVOTON/OU=EXCHANGE/CN=LEGACY",
+            email_display="IS10 Legacy Exchange Person (legacy.person@nuvoton.com)",
+        ),
+        FakeContact(
+            "contact-4",
+            "No Address Person",
+            email="/O=NUVOTON/OU=EXCHANGE/CN=NOADDR",
+        ),
+        FakeContact(
+            "contact-5",
+            "IS10 Ronen Boazi",
+            email="/O=NUVOTON/OU=EXCHANGE/CN=RBOAZI",
+            email_display="IS10 Ronen Boazi",
+        ),
+    ]
+    contacts = FakeFolder("Contacts", items=contact_items)
+    # Only the display name is a key, mirroring the real GAL.
+    directory = {
+        "eran raz": FakeAddressEntry(
+            "gal-1",
+            "IS50 Eran Raz",
+            "/O=NUVOTON/OU=EXCHANGE/CN=ERANRAZ",
+            FakeExchangeUser(
+                "IS50 Eran Raz",
+                "eran.raz@nuvoton.com",
+                job_title="HW Designer",
+                department="IS50",
+            ),
+        ),
+        "ronen boazi": FakeAddressEntry(
+            "gal-2",
+            "IS10 Ronen Boazi",
+            "ronen.boazi@nuvoton.com",
+        ),
+        # The directory key is the full display name, prefix and all - which is
+        # exactly what a saved contact stores.
+        "is10 ronen boazi": FakeAddressEntry(
+            "gal-2",
+            "IS10 Ronen Boazi",
+            "ronen.boazi@nuvoton.com",
+        ),
+    }
     root = FakeFolder("me@nuvoton.com", children=[inbox, sent])
     namespace = FakeNamespace(
         [root],
-        defaults={6: inbox, 5: sent, 16: FakeFolder("Drafts"), 9: calendar},
+        defaults={6: inbox, 5: sent, 16: FakeFolder("Drafts"), 9: calendar, 10: contacts},
         by_id={item.EntryID: item for item in inbox_items},
+        directory=directory,
     )
     app = FakeApp(namespace)
     config = OutlookConfig(
@@ -934,6 +1091,7 @@ def test_expected_tools_are_registered():
         "get_message",
         "search_messages",
         "list_calendar_events",
+        "search_contacts",
         "mark_read",
         "create_draft",
         "send_mail",
@@ -1175,3 +1333,154 @@ def test_scan_hint_names_max_results_when_that_is_the_real_cap():
     assert results[-1]["more_available"] is True
     assert "OUTLOOK_MAX_RESULTS" in results[-1]["scan_hint"]
     assert "you asked for 200" in results[-1]["scan_hint"]
+
+
+# ------------------------------------------------------------------ contacts
+
+
+def test_gal_probes_derives_the_display_name_from_an_alias():
+    # The exact failure that motivated this: the GAL knows "Eran Raz", never
+    # "eran.raz".
+    assert gal_probes("eran.raz") == ["eran.raz", "eran raz"]
+
+
+def test_gal_probes_does_not_add_a_redundant_case_variant():
+    # Resolution is case-insensitive, so "Eran Raz" would be a wasted probe.
+    assert gal_probes("eran raz") == ["eran raz"]
+
+
+def test_gal_probes_leaves_a_proper_display_name_alone():
+    assert gal_probes("Eran Raz") == ["Eran Raz"]
+
+
+def test_gal_probes_does_not_mangle_a_domain():
+    probes = gal_probes("oren.goldstein@nuvoton.com")
+    assert probes[0] == "oren.goldstein@nuvoton.com"
+    assert not any("nuvoton com" in p for p in probes)
+
+
+def test_gal_probes_of_blank_is_empty():
+    assert gal_probes("   ") == []
+
+
+def test_list_contacts_matches_on_name():
+    client, _, _ = build_client()
+    found = client.list_contacts("itamar")
+    assert [c["name"] for c in found] == ["Itamar Tamir"]
+    assert found[0]["emails"] == ["itamar.tamir@nuvoton.com"]
+    assert found[0]["source"] == "contacts"
+
+
+def test_list_contacts_matches_on_company_and_job_title():
+    client, _, _ = build_client()
+    assert [c["name"] for c in client.list_contacts("Example Ltd")] == ["Dana Levi"]
+    assert [c["name"] for c in client.list_contacts("FW Engineer")] == ["Itamar Tamir"]
+
+
+def test_list_contacts_recovers_the_smtp_from_an_exchange_display_name():
+    # In a corporate mailbox every saved contact looks like this: an X500 DN in
+    # the address field, the real address only in the display name.
+    client, _, _ = build_client()
+    found = client.list_contacts("Legacy")
+    assert found[0]["emails"] == ["legacy.person@nuvoton.com"]
+
+
+def test_list_contacts_leaves_emails_empty_when_nothing_is_mailable():
+    client, _, _ = build_client()
+    assert client.list_contacts("No Address Person")[0]["emails"] == []
+
+
+def test_smtp_from_display_name_ignores_text_without_an_address():
+    assert smtp_from_display_name("IS10 Someone") == ""
+    assert smtp_from_display_name("") == ""
+
+
+def test_list_contacts_asks_the_directory_when_the_item_has_no_address():
+    # X500 DN plus a bare display name - the address exists nowhere on the
+    # contact itself, only in the GAL.
+    client, _, _ = build_client()
+    found = client.list_contacts("IS10 Ronen Boazi")
+    assert found[0]["emails"] == ["ronen.boazi@nuvoton.com"]
+    # Still reported as a saved contact, since that is where it was found.
+    assert found[0]["source"] == "contacts"
+
+
+def test_list_contacts_without_a_query_returns_everyone():
+    client, _, _ = build_client()
+    assert len(client.list_contacts("")) == 5
+
+
+def test_resolve_gal_finds_a_colleague_from_the_alias():
+    client, _, _ = build_client()
+    found = client.resolve_gal("eran.raz")
+    assert found[0]["emails"] == ["eran.raz@nuvoton.com"]
+    assert found[0]["source"] == "gal"
+    # Reports the spelling that actually worked, not the one asked for.
+    assert found[0]["matched"] == "eran raz"
+    assert found[0]["job_title"] == "HW Designer"
+
+
+def test_resolve_gal_prefers_smtp_over_the_x500_dn():
+    client, _, _ = build_client()
+    assert client.resolve_gal("Eran Raz")[0]["emails"] == ["eran.raz@nuvoton.com"]
+
+
+def test_resolve_gal_handles_an_entry_without_an_exchange_user():
+    client, _, _ = build_client()
+    found = client.resolve_gal("ronen.boazi")
+    assert found[0]["emails"] == ["ronen.boazi@nuvoton.com"]
+
+
+def test_resolve_gal_returns_nothing_for_an_unknown_name():
+    client, _, _ = build_client()
+    assert client.resolve_gal("nobody.here") == []
+
+
+def test_search_contacts_falls_back_to_the_gal():
+    client, _, _ = build_client()
+    # Eran is not in Contacts at all - only the directory knows him.
+    found = client.search_contacts("eran.raz")
+    assert [c["source"] for c in found] == ["gal"]
+
+
+def test_search_contacts_prefers_a_saved_contact_over_the_gal():
+    client, _, _ = build_client()
+    found = client.search_contacts("itamar")
+    assert found[0]["source"] == "contacts"
+
+
+def test_search_contacts_can_stay_out_of_the_gal():
+    client, _, _ = build_client()
+    assert client.search_contacts("eran.raz", include_gal=False) == []
+
+
+def test_search_contacts_deduplicates_by_address():
+    client, _, _ = build_client()
+    found = client.search_contacts("ronen.boazi")
+    assert len([c for c in found if "ronen.boazi@nuvoton.com" in c["emails"]]) == 1
+
+
+def test_search_contacts_respects_the_limit():
+    client, _, _ = build_client()
+    assert len(client.search_contacts("", limit=2)) == 2
+
+
+def test_search_contacts_tool_shapes_the_result():
+    client, config, _ = build_client()
+    found = tools_of(build_server(config, client))["search_contacts"](query="eran.raz")
+    assert found[0]["name"] == "IS50 Eran Raz"
+    assert found[0]["emails"] == ["eran.raz@nuvoton.com"]
+    assert found[0]["department"] == "IS50"
+    # Empty optional fields are omitted rather than returned blank.
+    assert "business_phone" not in found[0]
+
+
+def test_search_contacts_tool_rejects_a_blank_query():
+    client, config, _ = build_client()
+    with pytest.raises(ValueError):
+        tools_of(build_server(config, client))["search_contacts"](query="  ")
+
+
+def test_search_contacts_is_registered_as_a_tool():
+    client, config, _ = build_client()
+    assert "search_contacts" in tools_of(build_server(config, client))

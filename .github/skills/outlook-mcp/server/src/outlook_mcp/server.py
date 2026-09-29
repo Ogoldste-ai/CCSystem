@@ -6,7 +6,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .config import OutlookConfig
-from .models import CalendarEvent, MailMessage
+from .models import CalendarEvent, Contact, MailMessage
 from .outlook import OutlookClient
 
 
@@ -232,6 +232,28 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
             )
             for raw in raws
         ]
+
+    @server.tool()
+    def search_contacts(
+        query: str, limit: int = 10, include_gal: bool = True
+    ) -> list[dict[str, Any]]:
+        """Find a person's email address by name, alias or partial address.
+
+        Searches your Contacts folder first, then the organisation's address
+        book (GAL). Use this before mailing someone you have not corresponded
+        with - searching mail folders for them will find nothing, because
+        there is nothing there yet.
+
+        The GAL matches on display name rather than alias, so "eran.raz" is
+        tried as "Eran Raz" too; `matched` reports which spelling actually hit.
+        Set `include_gal=False` to stay inside your own saved contacts.
+        """
+        if not query.strip():
+            raise ValueError("query is required.")
+        raws = client.search_contacts(
+            query=query.strip(), limit=_cap(limit), include_gal=include_gal
+        )
+        return [Contact.from_raw(raw).to_dict() for raw in raws]
 
     @server.tool()
     def mark_read(entry_id: str, read: bool = True) -> dict[str, Any]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Iterable, Iterator
@@ -11,10 +12,12 @@ OL_FOLDER_INBOX = 6
 OL_FOLDER_SENT = 5
 OL_FOLDER_DRAFTS = 16
 OL_FOLDER_CALENDAR = 9
+OL_FOLDER_CONTACTS = 10
 
 OL_TO, OL_CC, OL_BCC = 1, 2, 3
 OL_MAIL_ITEM = 43
 OL_APPOINTMENT_ITEM = 26
+OL_CONTACT_ITEM = 40
 
 # PR_SENT_REPRESENTING_SMTP_ADDRESS. Exchange hands back an X500 DN from
 # SenderEmailAddress, which is useless for replying, so read the SMTP property
@@ -86,6 +89,56 @@ def _to_iso(value: Any) -> str:
         if result:
             return str(result)
     return ""
+
+
+_SMTP_IN_PARENS = re.compile(r"\(([^()\s]+@[^()\s]+)\)")
+
+
+def smtp_from_display_name(text: str) -> str:
+    """Pull the real SMTP address out of a contact's display name.
+
+    Exchange-backed contacts store an unusable X500 DN in ``Email1Address`` and
+    put the address in the display name instead, as
+    ``"IS10 Ran Bachinsky (ran.bachinsky@nuvoton.com)"``. In a corporate
+    mailbox that is *every* saved contact, so without this the Contacts folder
+    returns a list of names with no way to mail any of them.
+    """
+    match = _SMTP_IN_PARENS.search(text or "")
+    return match.group(1) if match else ""
+
+
+def gal_probes(query: str) -> list[str]:
+    """Spellings to try when resolving a name against the address book.
+
+    The GAL matches on *display name*, not on the mail alias: "Eran Raz"
+    resolves where "eran.raz" and "eran" both fail outright. Callers naturally
+    type the alias - it is what they see in an address - so derive the spaced
+    form as well.
+
+    Matching is case- and order-insensitive on the real object model ("eran raz"
+    and "Raz Eran" both resolve), so only the separators are worth varying;
+    case variants would be redundant probes.
+    """
+    raw = (query or "").strip()
+    if not raw:
+        return []
+
+    if "@" in raw:
+        # An address resolves directly. Splitting on dots would also wreck the
+        # domain ("nuvoton com"), so only the local part is worth respelling.
+        local = raw.split("@", 1)[0]
+        probes = [raw, re.sub(r"[._]+", " ", local).strip()]
+    else:
+        probes = [raw, re.sub(r"[._]+", " ", raw).strip()]
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for probe in probes:
+        key = probe.lower()
+        if probe and key not in seen:
+            seen.add(key)
+            out.append(probe)
+    return out
 
 
 class OutlookClient:
@@ -422,6 +475,201 @@ class OutlookClient:
             out.append(raw)
         out.sort(key=lambda raw: str(raw.get("start") or ""))
         return out
+
+    # ---------------------------------------------------------------- contacts
+
+    def contact_to_raw(self, item: Any) -> dict[str, Any]:
+        emails: list[str] = []
+        for addr_attr, name_attr in (
+            ("Email1Address", "Email1DisplayName"),
+            ("Email2Address", "Email2DisplayName"),
+            ("Email3Address", "Email3DisplayName"),
+        ):
+            value = str(_safe(lambda a=addr_attr: getattr(item, a), "") or "").strip()
+            # An X500 DN cannot be mailed to, but the display name beside it
+            # carries the genuine SMTP address.
+            if not value or value.upper().startswith("/O="):
+                value = smtp_from_display_name(
+                    str(_safe(lambda a=name_attr: getattr(item, a), "") or "")
+                )
+            if value and value not in emails:
+                emails.append(value)
+        name = str(_safe(lambda: item.FullName, "") or "").strip()
+        company = str(_safe(lambda: item.CompanyName, "") or "").strip()
+        categories = [
+            part.strip()
+            for part in str(_safe(lambda: item.Categories, "") or "").split(",")
+            if part.strip()
+        ]
+        return {
+            "entry_id": str(_safe(lambda: item.EntryID, "") or ""),
+            "name": name or company,
+            "emails": emails,
+            "company": company,
+            "job_title": str(_safe(lambda: item.JobTitle, "") or "").strip(),
+            "department": str(_safe(lambda: item.Department, "") or "").strip(),
+            "office": str(_safe(lambda: item.OfficeLocation, "") or "").strip(),
+            "business_phone": str(
+                _safe(lambda: item.BusinessTelephoneNumber, "") or ""
+            ).strip(),
+            "mobile_phone": str(
+                _safe(lambda: item.MobileTelephoneNumber, "") or ""
+            ).strip(),
+            "categories": categories,
+            "source": "contacts",
+        }
+
+    def list_contacts(self, query: str = "", limit: int = 25) -> list[dict[str, Any]]:
+        """Search the personal Contacts folder by substring.
+
+        Matching is deliberately loose - name, address, company and job title -
+        because the caller rarely knows which of those their half-remembered
+        string came from.
+        """
+        folder = _safe(lambda: self.namespace.GetDefaultFolder(OL_FOLDER_CONTACTS))
+        if folder is None:
+            return []
+        items = _safe(lambda: folder.Items)
+        if items is None:
+            return []
+
+        needle = (query or "").strip().lower()
+        out: list[dict[str, Any]] = []
+        count = int(_safe(lambda: items.Count, 0) or 0)
+        # Bounded, as elsewhere: a large Contacts folder must not turn one tool
+        # call into a full-store walk.
+        scan_cap = max(limit * 20, 200)
+        for index in range(1, min(count, scan_cap) + 1):
+            if len(out) >= limit:
+                break
+            item = _safe(lambda i=index: items.Item(i))
+            if item is None:
+                continue
+            if _as_int(_safe(lambda: item.Class), OL_CONTACT_ITEM) != OL_CONTACT_ITEM:
+                continue
+            raw = _safe(lambda i=item: self.contact_to_raw(i))
+            if not raw:
+                continue
+            if needle:
+                haystack = " ".join(
+                    [
+                        str(raw.get("name") or ""),
+                        " ".join(raw.get("emails") or []),
+                        str(raw.get("company") or ""),
+                        str(raw.get("job_title") or ""),
+                    ]
+                ).lower()
+                if needle not in haystack:
+                    continue
+            if not raw.get("emails"):
+                # Some contacts carry only an X500 DN and a bare display name,
+                # with no address anywhere on the item. The directory still
+                # knows them, so ask it rather than returning a contact that
+                # nobody can actually mail. Done after filtering so it costs a
+                # directory round-trip only for results we are returning.
+                raw["emails"] = self._gal_email_for(str(raw.get("name") or ""))
+            out.append(raw)
+        return out
+
+    def _gal_email_for(self, name: str) -> list[str]:
+        """Best-effort address lookup for a contact that has none."""
+        if not name.strip():
+            return []
+        for hit in self.resolve_gal(name, limit=1):
+            if hit.get("emails"):
+                return list(hit["emails"])
+        return []
+
+    def _address_entry_to_raw(self, entry: Any, name: str = "") -> dict[str, Any]:
+        """Normalise a resolved AddressEntry, preferring Exchange detail."""
+        display = name or str(_safe(lambda: entry.Name, "") or "")
+        smtp = ""
+        job_title = department = office = mobile = company = ""
+
+        user = _safe(lambda: entry.GetExchangeUser())
+        if user is not None:
+            smtp = str(_safe(lambda: user.PrimarySmtpAddress, "") or "")
+            display = display or str(_safe(lambda: user.Name, "") or "")
+            job_title = str(_safe(lambda: user.JobTitle, "") or "")
+            department = str(_safe(lambda: user.Department, "") or "")
+            office = str(_safe(lambda: user.OfficeLocation, "") or "")
+            mobile = str(_safe(lambda: user.MobileTelephoneNumber, "") or "")
+            company = str(_safe(lambda: user.CompanyName, "") or "")
+
+        if not smtp:
+            candidate = str(_safe(lambda: entry.Address, "") or "")
+            # An X500 DN cannot be mailed to; better to return no address than
+            # one that silently bounces.
+            if candidate and not candidate.upper().startswith("/O="):
+                smtp = candidate
+
+        return {
+            "entry_id": str(_safe(lambda: entry.ID, "") or ""),
+            "name": display,
+            "emails": [smtp] if smtp else [],
+            "company": company,
+            "job_title": job_title,
+            "department": department,
+            "office": office,
+            "business_phone": "",
+            "mobile_phone": mobile,
+            "categories": [],
+            "source": "gal",
+        }
+
+    def resolve_gal(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Resolve a name against the address book (GAL).
+
+        This is the path that finds colleagues you have never exchanged mail
+        with, which is precisely when searching your own mailbox comes up
+        empty. Several spellings are tried because the GAL matches on display
+        name rather than alias - see :func:`gal_probes`.
+        """
+        out: list[dict[str, Any]] = []
+        for probe in gal_probes(query):
+            if len(out) >= limit:
+                break
+            recipient = _safe(lambda p=probe: self.namespace.CreateRecipient(p))
+            if recipient is None:
+                continue
+            if not _safe(lambda r=recipient: r.Resolve(), False):
+                continue
+            if not _safe(lambda r=recipient: r.Resolved, False):
+                continue
+            entry = _safe(lambda r=recipient: r.AddressEntry)
+            if entry is None:
+                continue
+            name = str(_safe(lambda r=recipient: r.Name, "") or "")
+            raw = _safe(lambda e=entry, n=name: self._address_entry_to_raw(e, n))
+            if raw:
+                raw["matched"] = probe
+                out.append(raw)
+        return out
+
+    def search_contacts(
+        self, query: str, limit: int = 10, include_gal: bool = True
+    ) -> list[dict[str, Any]]:
+        """Find people, looking in the Contacts folder and then the GAL.
+
+        Personal contacts come first because they are the ones the user chose
+        to save; the GAL is the fallback that makes the whole directory
+        reachable. Results are de-duplicated by address.
+        """
+        results = self.list_contacts(query, limit=limit)
+        if include_gal and len(results) < limit:
+            results.extend(self.resolve_gal(query, limit=limit - len(results)))
+
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for entry in results:
+            emails = [e.lower() for e in (entry.get("emails") or [])]
+            key = emails[0] if emails else str(entry.get("name") or "").lower()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(entry)
+        return deduped[:limit]
 
     def list_raw(
         self,

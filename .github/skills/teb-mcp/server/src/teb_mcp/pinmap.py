@@ -105,6 +105,17 @@ class PinMap:
             if candidate in pins:
                 return pins[candidate]["value"]
 
+        # The header writes GPIO_B06; the netlist - and therefore ``pin_net``
+        # and ``list_pins`` - writes GPIO_B6. Accepting only one spelling means
+        # a name this server just handed out is rejected by the tool it was
+        # meant for.
+        match = re.fullmatch(r"(GPIO_[A-Za-z])0*(\d+)", key)
+        if match:
+            family, index = match.group(1).upper(), int(match.group(2))
+            for candidate in ("%s%02d" % (family, index), "%s%d" % (family, index)):
+                if candidate in pins:
+                    return pins[candidate]["value"]
+
         if not self.data.get("available"):
             raise ValueError(
                 "cannot resolve pin name %r because TebConnector.h was not "

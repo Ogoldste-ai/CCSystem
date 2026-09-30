@@ -197,11 +197,14 @@ class Session:
             api.open_bitstream(path)
             result["bitstream"] = path
 
-        if host:
+        if mode in ("virtual", "usb-remote"):
             result["host"] = host
             result["port"] = int(port)
 
-        self.target = "%s:%s" % (mode, host or "local")
+        self.target = "%s:%s" % (
+            mode,
+            host if mode in ("virtual", "usb-remote") else "local",
+        )
         return result
 
     def cmd_disconnect(self):

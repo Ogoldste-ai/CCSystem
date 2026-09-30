@@ -27,6 +27,8 @@ client --stdio--> teb_mcp.server   (64-bit, FastMCP)
 | `src/teb_mcp/bridge.py` | spawns the worker, JSON-lines RPC, timeouts, restart |
 | `src/teb_mcp/config.py` | environment parsing, CE machine aliases |
 | `src/teb_mcp/pinmap.py` | parses `TebConnector.h` into symbolic pin names |
+| `src/teb_mcp/netlist.py` | parses the Allegro netlist into nets and connector locations |
+| `src/teb_mcp/usb.py` | read-only probe of the board's USB presence and driver state |
 | `src/teb_mcp/worker/teb_worker.py` | 32-bit session owner, command dispatch |
 | `src/teb_mcp/worker/teb_api.py` | ctypes bindings to the mangled DLL exports |
 
@@ -239,7 +241,8 @@ curl.exe -s -N -X POST http://127.0.0.1:8767/mcp `
 |---|---|
 | `no 32-bit Python found` | install the embeddable build, or set `TEB_PYTHON32` |
 | `TEB_If.dll not found` | TEB Interface package not installed; or set `TEB_DLL_PATH` |
-| `TEB_ConnectEx failed with code 1` | TEB communication error - no board reachable, wrong host/port, or the CE machine's TEB server is not running |
+| `TEB_ConnectEx failed with code 1` | generic communication error - board absent, **present but with no driver bound**, wrong host/port, or the CE machine's TEB server is not running. For USB modes the error carries a `USB diagnosis:` line saying which |
+| USB board "not found" in Device Manager | it enumerates as `Hermon`, not `TEB` - search `USB\VID_0416*`; see below |
 | `timed out after Ns` | board or link wedged; worker restarted, reconnect |
 | `already connected` | the session is exclusive - `disconnect()` first |
 | `Make sure TEB isn't being occupied by another tool` | the C++ harness or another TEB application holds the board |
@@ -247,3 +250,22 @@ curl.exe -s -N -X POST http://127.0.0.1:8767/mcp `
 
 Set `TEB_WORKER_LOG` to a file path to capture everything the DLL prints; that
 log is the only place its diagnostics appear.
+
+### The USB device is a "Hermon", and it needs WinUSB
+
+`TEB_If.dll` reaches a real board through **WinUSB**, matching the hardware IDs
+`USB\VID_0416&PID_0030`, `&PID_0031` and `&PID_0032` (`0416` is Nuvoton /
+Winbond). With no driver bound the device shows up as `Hermon Mass Storage
+Device` with Windows problem **code 28** and no device class, there is no
+WinUSB interface for `SETUPAPI` to open, and `TEB_ConnectEx` fails with code 1 -
+identical to the "no board" case. Installing the Nuvoton TEB USB driver binds it
+to service `WinUSB` (`TEB3 USB Driver`, class `CustomUSBDevices`) and requires
+administrator rights.
+
+`teb_mcp/usb.py` probes this through `cfgmgr32` in the 64-bit parent process:
+read-only, no privileges, no dependency on the worker or the DLL, so it still
+answers when those are broken. `health()` exposes it as `usb.state`, one of
+`ready`, `no-driver`, `problem` or `absent`, and `connect()` appends the same
+verdict to a code-1 failure. It is purely diagnostic and never gates a call -
+hardware IDs change across board generations, and a wrong "absent" verdict must
+never block a connection that would otherwise succeed.

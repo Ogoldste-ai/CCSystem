@@ -30,6 +30,11 @@ enabled (see **Environment**).
 - `create_merge_request_diff_comment(project, iid, body, new_path="", new_line=None, old_path="", old_line=None, base_sha="", head_sha="", start_sha="")` - inline comment on a diff line
 - `reply_to_merge_request_discussion(project, iid, discussion_id, body)`
 - `resolve_merge_request_discussion(project, iid, discussion_id, resolved=True)`
+- `create_issue(project="", title="", description="", labels=None, assignee="", milestone_id=None, confidential=False)` - `assignee` takes usernames (comma-separated), which are resolved to ids via `GET /users`; an unknown username is an error rather than a silent drop. The result carries `suggested_branch`.
+- `create_branch(project="", branch="", ref="", from_issue_iid=None)` - omit `branch` and pass `from_issue_iid` to get GitLab's own `<iid>-<slugified-title>` name; omit `ref` to branch from the project default branch.
+- `update_issue(project="", iid, title="", description=None, labels=None, assignee="", state_event="")` - only the fields actually supplied are sent. `description` defaults to `None` rather than `""` so omitting it cannot blank an existing body; pass `""` to clear it deliberately. `state_event` is `"close"` or `"reopen"`.
+- `upload_attachment(project="", file_path)` - multipart upload to `POST /projects/:id/uploads`; content type is sniffed with `mimetypes`. Returns `markdown`, ready to paste into an issue or comment. **The link is project-scoped** and will not render from a different project.
+- `create_commit(project="", branch, message, actions, start_branch="")` - one commit containing any number of file actions. Use the module-level `file_action(local_path, repo_path)` helper to build an action from a file on disk; it always base64-encodes, so binaries are safe.
 
 `create_merge_request_diff_comment` fetches `base_sha`, `head_sha` and
 `start_sha` from the merge request when they are not supplied. GitLab rejects a

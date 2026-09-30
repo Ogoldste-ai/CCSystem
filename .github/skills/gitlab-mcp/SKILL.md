@@ -84,6 +84,11 @@ Write - all require `GITLAB_ALLOW_WRITE`:
 - `create_merge_request_diff_comment(project, iid, body, new_path, new_line, ...)`
 - `reply_to_merge_request_discussion(project, iid, discussion_id, body)`
 - `resolve_merge_request_discussion(project, iid, discussion_id, resolved=True)`
+- `create_issue(project="", title, description="", labels=None, assignee="", milestone_id=None, confidential=False)`
+- `update_issue(project="", iid, title="", description=None, labels=None, assignee="", state_event="")`
+- `create_branch(project="", branch="", ref="", from_issue_iid=None)`
+- `upload_attachment(project="", file_path)` - returns a markdown snippet to embed
+- `create_commit(project="", branch, message, actions, start_branch="")`
 
 ## Workflow A - status of a merge request I opened
 
@@ -117,6 +122,37 @@ Write - all require `GITLAB_ALLOW_WRITE`:
    - overall feedback: `create_merge_request_note(iid, body)`
    - follow-up in a thread: `reply_to_merge_request_discussion(...)`
    - closing a thread: `resolve_merge_request_discussion(...)`
+
+## Workflow C - turn a review into a tracked issue and a branch
+
+Useful when a review (on the MR, or held somewhere unrecordable like a chat)
+needs to become actionable work.
+
+1. `list_merge_request_discussions(iid)` to gather the review content. Each
+   inline note carries the file and line it is anchored to, so the resulting
+   issue can cite exact locations.
+2. `create_issue(title=..., description=..., labels=[...], assignee="...")`.
+   Write the description grouped by file or theme and link back to the MR.
+3. `create_branch(from_issue_iid=<the new iid>)` - leave `branch` empty so the
+   name matches what GitLab's own "create branch" button would produce, and
+   leave `ref` empty to branch from the default branch.
+
+Both steps 2 and 3 require `GITLAB_ALLOW_WRITE`. `create_issue` also returns
+`suggested_branch`, so the intended branch name can be shown for confirmation
+before anything is created.
+
+To add a screenshot to the issue afterwards:
+
+4. `upload_attachment(file_path=...)` and keep the returned `markdown`.
+5. `get_issue(iid)` to read the current `description`, splice the snippet in,
+   then `update_issue(iid, description=...)` - the description is **replaced**,
+   not appended to, so the existing text must be re-sent intact.
+6. To keep the images in the repository as well,
+   `create_commit(branch=..., message=..., actions=[file_action(local, repo_path), ...])`.
+   Going through the API means no local clone, checkout or push is involved.
+
+Always transcribe the important text of a screenshot next to the image. GitLab
+uploads can be pruned, and a reader with only a dead image link has nothing.
 
 ## Running the server manually
 

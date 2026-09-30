@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
+import mimetypes
 import os
+import re
 import ssl
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -11,11 +15,55 @@ import truststore
 
 TRUTHY = {"1", "true", "yes", "on"}
 
+BRANCH_SLUG_MAX_LENGTH = 100
+
 WRITE_DISABLED_MESSAGE = (
     "GitLab write operations are disabled. Set GITLAB_ALLOW_WRITE=1 in the MCP server "
     "environment and restart or reload the client to enable them. The GITLAB_TOKEN must "
     "also carry the 'api' scope; 'read_api' cannot post comments."
 )
+
+
+def slugify(value: str) -> str:
+    """Reproduce GitLab's own `Gitlab::Utils.slugify` for branch names.
+
+    Lowercase, every non-alphanumeric run collapsed to a single dash, dashes
+    trimmed from both ends. Matching GitLab exactly matters so branches created
+    here are indistinguishable from ones made with the UI's "create branch"
+    button.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").lower())
+    return slug.strip("-")
+
+
+def issue_branch_name(iid: int, title: str, *, confidential: bool = False) -> str:
+    """The branch name GitLab itself would suggest for an issue.
+
+    Confidential issues deliberately get a title-free name so the branch does not
+    leak the issue subject, which is what GitLab does too.
+    """
+    if confidential:
+        return f"{iid}-confidential-issue"
+    slug = slugify(title)[:BRANCH_SLUG_MAX_LENGTH].strip("-")
+    return f"{iid}-{slug}" if slug else str(iid)
+
+
+def file_action(local_path: str, repo_path: str, *, action: str = "create") -> dict[str, Any]:
+    """Build a GitLab commit action that uploads a local file as-is.
+
+    Always base64-encodes, so the same helper is safe for binaries (PNGs) and
+    text alike; guessing by extension would silently corrupt anything
+    misidentified.
+    """
+    source = Path(local_path)
+    if not source.is_file():
+        raise ValueError(f"file not found: {local_path}")
+    return {
+        "action": action,
+        "file_path": repo_path,
+        "content": base64.b64encode(source.read_bytes()).decode("ascii"),
+        "encoding": "base64",
+    }
 
 
 class GitLabApiError(RuntimeError):
@@ -136,16 +184,24 @@ class GitLabClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
         accept: str = "application/json",
     ) -> Any:
         headers = {"Accept": accept}
+        extra: dict[str, Any] = {}
+        if files is not None:
+            # httpx must not be given a JSON body and a multipart body at once;
+            # the multipart encoding wins and the JSON would be silently dropped.
+            extra["files"] = files
+        else:
+            extra["json"] = json_body
         try:
             response = self._client.request(
                 method,
                 path,
                 params=self._clean_params(params or {}),
-                json=json_body,
                 headers=headers,
+                **extra,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -808,11 +864,9 @@ class GitLabClient:
             for item in payload
         ]
 
-    def get_issue(self, project: str, iid: int, *, include_notes: bool = False) -> dict[str, Any]:
-        project_value = self._resolve_project_value(project)
-        encoded = self._encode_project(project_value)
-        payload = self._request("GET", f"/projects/{encoded}/issues/{iid}")
-        result = {
+    @staticmethod
+    def _format_issue(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
             "iid": payload.get("iid"),
             "title": payload.get("title"),
             "description": payload.get("description"),
@@ -823,6 +877,229 @@ class GitLabClient:
             "web_url": payload.get("web_url"),
             "updated_at": payload.get("updated_at"),
         }
+
+    def get_issue(self, project: str, iid: int, *, include_notes: bool = False) -> dict[str, Any]:
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+        payload = self._request("GET", f"/projects/{encoded}/issues/{iid}")
+        result = self._format_issue(payload)
         if include_notes:
             result["notes"] = self._request("GET", f"/projects/{encoded}/issues/{iid}/notes")
         return result
+
+    def _resolve_user_ids(self, usernames: str) -> list[int]:
+        """Map comma-separated usernames to GitLab numeric ids.
+
+        The issues API assigns by id, never by username, so this lookup is
+        unavoidable. An unknown username is a hard error rather than a silent
+        drop: quietly creating an unassigned issue is worse than failing.
+        """
+        ids: list[int] = []
+        for name in (part.strip() for part in (usernames or "").split(",")):
+            if not name:
+                continue
+            matches = self._request("GET", "/users", params={"username": name}) or []
+            if not matches:
+                raise ValueError(f"no GitLab user found with username {name!r}")
+            ids.append(matches[0]["id"])
+        return ids
+
+    def create_issue(
+        self,
+        project: str = "",
+        *,
+        title: str = "",
+        description: str = "",
+        labels: list[str] | None = None,
+        assignee: str = "",
+        milestone_id: int | None = None,
+        confidential: bool = False,
+    ) -> dict[str, Any]:
+        """Open a new issue."""
+        self._require_write()
+        subject = (title or "").strip()
+        if not subject:
+            raise ValueError("title must be a non-empty string")
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+
+        body: dict[str, Any] = {"title": subject}
+        if description:
+            body["description"] = description
+        if labels:
+            body["labels"] = ",".join(labels)
+        if confidential:
+            body["confidential"] = True
+        if milestone_id:
+            body["milestone_id"] = milestone_id
+        assignee_ids = self._resolve_user_ids(assignee)
+        if assignee_ids:
+            body["assignee_ids"] = assignee_ids
+
+        payload = self._request("POST", f"/projects/{encoded}/issues", json_body=body)
+        result = self._format_issue(payload)
+        result["suggested_branch"] = issue_branch_name(
+            payload.get("iid"),
+            payload.get("title") or subject,
+            confidential=bool(payload.get("confidential")),
+        )
+        return result
+
+    def create_branch(
+        self,
+        project: str = "",        *,
+        branch: str = "",
+        ref: str = "",
+        from_issue_iid: int | None = None,
+    ) -> dict[str, Any]:
+        """Create a branch, optionally named after an issue.
+
+        With `from_issue_iid` and no explicit `branch`, the name is derived the
+        way GitLab's own "create merge request / branch" button does
+        (`<iid>-<slugified-title>`), so branches stay consistent with ones made
+        through the UI. An omitted `ref` falls back to the project default
+        branch.
+        """
+        self._require_write()
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+
+        name = (branch or "").strip()
+        if not name:
+            if not from_issue_iid:
+                raise ValueError("branch is required unless from_issue_iid is given")
+            issue = self._request("GET", f"/projects/{encoded}/issues/{from_issue_iid}") or {}
+            name = issue_branch_name(
+                from_issue_iid,
+                issue.get("title") or "",
+                confidential=bool(issue.get("confidential")),
+            )
+
+        source = (ref or "").strip()
+        if not source:
+            source = (self._request("GET", f"/projects/{encoded}") or {}).get("default_branch") or ""
+        if not source:
+            raise ValueError("ref is required; the project has no default branch to fall back to")
+
+        payload = self._request(
+            "POST",
+            f"/projects/{encoded}/repository/branches",
+            json_body={"branch": name, "ref": source},
+        )
+        result = self._format_branch(payload)
+        result["ref"] = source
+        return result
+
+    def update_issue(
+        self,
+        project: str = "",
+        iid: int = 0,
+        *,
+        title: str = "",
+        description: str | None = None,
+        labels: list[str] | None = None,
+        assignee: str = "",
+        state_event: str = "",
+    ) -> dict[str, Any]:
+        """Edit an existing issue.
+
+        Only the fields actually supplied are sent. `description` defaults to
+        None rather than "" precisely so that omitting it cannot blank an
+        existing body - passing an empty string is still a legitimate way to
+        clear it deliberately.
+        """
+        self._require_write()
+        if not iid:
+            raise ValueError("iid is required")
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+
+        body: dict[str, Any] = {}
+        if title:
+            body["title"] = title
+        if description is not None:
+            body["description"] = description
+        if labels is not None:
+            body["labels"] = ",".join(labels)
+        if state_event:
+            if state_event not in ("close", "reopen"):
+                raise ValueError("state_event must be 'close' or 'reopen'")
+            body["state_event"] = state_event
+        assignee_ids = self._resolve_user_ids(assignee)
+        if assignee_ids:
+            body["assignee_ids"] = assignee_ids
+        if not body:
+            raise ValueError("nothing to update; pass at least one field")
+
+        payload = self._request("PUT", f"/projects/{encoded}/issues/{iid}", json_body=body)
+        return self._format_issue(payload)
+
+    def upload_attachment(self, project: str = "", file_path: str = "") -> dict[str, Any]:
+        """Upload a file to a project and return its markdown snippet.
+
+        The returned markdown only renders inside this project - GitLab scopes
+        `/uploads/...` links per project, so the snippet cannot be reused in an
+        issue elsewhere.
+        """
+        self._require_write()
+        if not file_path:
+            raise ValueError("file_path is required")
+        source = Path(file_path)
+        if not source.is_file():
+            raise ValueError(f"file not found: {file_path}")
+
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+        content_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+        payload = self._request(
+            "POST",
+            f"/projects/{encoded}/uploads",
+            files={"file": (source.name, source.read_bytes(), content_type)},
+        )
+        return {
+            "alt": payload.get("alt"),
+            "url": payload.get("url"),
+            "full_path": payload.get("full_path"),
+            "markdown": payload.get("markdown"),
+        }
+
+    def create_commit(
+        self,
+        project: str = "",
+        *,
+        branch: str = "",
+        message: str = "",
+        actions: list[dict[str, Any]] | None = None,
+        start_branch: str = "",
+    ) -> dict[str, Any]:
+        """Commit one or more file actions in a single commit.
+
+        Each action is a GitLab commit action dict, e.g.
+        `{"action": "create", "file_path": "docs/a.png", "content": "<base64>",
+          "encoding": "base64"}`. Binary files must be base64 encoded; see
+        `file_action` for building one from a path on disk.
+        """
+        self._require_write()
+        if not branch:
+            raise ValueError("branch is required")
+        text = (message or "").strip()
+        if not text:
+            raise ValueError("message must be a non-empty commit message")
+        if not actions:
+            raise ValueError("at least one action is required")
+
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+        body: dict[str, Any] = {"branch": branch, "commit_message": text, "actions": actions}
+        if start_branch:
+            body["start_branch"] = start_branch
+
+        payload = self._request("POST", f"/projects/{encoded}/repository/commits", json_body=body)
+        return {
+            "id": payload.get("id"),
+            "short_id": payload.get("short_id"),
+            "title": payload.get("title"),
+            "author_name": payload.get("author_name"),
+            "created_at": payload.get("created_at"),
+            "web_url": payload.get("web_url"),
+        }

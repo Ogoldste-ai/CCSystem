@@ -278,6 +278,110 @@ def build_server() -> FastMCP:
     def get_issue(project: str, iid: int, include_notes: bool = False) -> dict[str, Any]:
         return client.get_issue(project=project, iid=iid, include_notes=include_notes)
 
+    @server.tool()
+    def create_issue(
+        project: str = "",
+        title: str = "",
+        description: str = "",
+        labels: list[str] | None = None,
+        assignee: str = "",
+        milestone_id: int | None = None,
+        confidential: bool = False,
+    ) -> dict[str, Any]:
+        """Open a new issue. Requires GITLAB_ALLOW_WRITE=1.
+
+        `assignee` takes usernames, not ids, and accepts a comma-separated list.
+        The result includes suggested_branch, the name GitLab itself would use
+        for a branch started from this issue; pass it to create_branch, or just
+        call create_branch with from_issue_iid.
+        """
+        return client.create_issue(
+            project=project,
+            title=title,
+            description=description,
+            labels=labels,
+            assignee=assignee,
+            milestone_id=milestone_id,
+            confidential=confidential,
+        )
+
+    @server.tool()
+    def create_branch(
+        project: str = "",
+        branch: str = "",
+        ref: str = "",
+        from_issue_iid: int | None = None,
+    ) -> dict[str, Any]:
+        """Create a branch. Requires GITLAB_ALLOW_WRITE=1.
+
+        To branch off an issue the way the GitLab UI does, pass from_issue_iid
+        and leave branch empty; the name becomes <iid>-<slugified-title>. An
+        omitted ref defaults to the project's default branch.
+        """
+        return client.create_branch(
+            project=project,
+            branch=branch,
+            ref=ref,
+            from_issue_iid=from_issue_iid,
+        )
+
+    @server.tool()
+    def update_issue(
+        project: str = "",
+        iid: int = 0,
+        title: str = "",
+        description: str | None = None,
+        labels: list[str] | None = None,
+        assignee: str = "",
+        state_event: str = "",
+    ) -> dict[str, Any]:
+        """Edit an existing issue. Requires GITLAB_ALLOW_WRITE=1.
+
+        Only the fields you pass are changed. `description` replaces the whole
+        body, so read the current text with get_issue first if you mean to
+        append to it. `state_event` is "close" or "reopen".
+        """
+        return client.update_issue(
+            project=project,
+            iid=iid,
+            title=title,
+            description=description,
+            labels=labels,
+            assignee=assignee,
+            state_event=state_event,
+        )
+
+    @server.tool()
+    def upload_attachment(project: str = "", file_path: str = "") -> dict[str, Any]:
+        """Upload a local file to a project. Requires GITLAB_ALLOW_WRITE=1.
+
+        Returns a `markdown` snippet to paste into an issue or comment body.
+        The link is project-scoped and will not render from another project.
+        """
+        return client.upload_attachment(project=project, file_path=file_path)
+
+    @server.tool()
+    def create_commit(
+        project: str = "",
+        branch: str = "",
+        message: str = "",
+        actions: list[dict[str, Any]] | None = None,
+        start_branch: str = "",
+    ) -> dict[str, Any]:
+        """Commit file changes directly via the API. Requires GITLAB_ALLOW_WRITE=1.
+
+        `actions` is a list of GitLab commit actions, e.g. {"action": "create",
+        "file_path": "docs/a.txt", "content": "hi"}. For binary files set
+        "encoding": "base64" and pass base64 content.
+        """
+        return client.create_commit(
+            project=project,
+            branch=branch,
+            message=message,
+            actions=actions,
+            start_branch=start_branch,
+        )
+
     return server
 
 

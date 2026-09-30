@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+
 import httpx
 import pytest
 
@@ -8,6 +10,9 @@ from gitlab_mcp.client import (
     GitLabClient,
     GitLabConfig,
     GitLabWriteDisabledError,
+    file_action,
+    issue_branch_name,
+    slugify,
 )
 
 PROJECT = "/projects/group%2Fproject"
@@ -50,10 +55,12 @@ class FakeHttpClient:
         self.calls: list[tuple[str, str, dict, dict, dict | None]] = []
         self.discussion_pages: dict[int, list] = {}
         self.collapse_diffs = False
+        self.files = None
 
-    def request(self, method: str, path: str, params=None, json=None, headers=None):
+    def request(self, method: str, path: str, params=None, json=None, headers=None, files=None):
         params = params or {}
         self.calls.append((method, path, params, headers or {}, json))
+        self.files = files
 
         if path == "/user":
             return FakeResponse({"id": 7, "username": "ogoldste", "name": "Oren Goldstein"})
@@ -208,7 +215,7 @@ class FakeHttpClient:
             )
         if path == f"{PROJECT}/merge_requests/12/raw_diffs":
             return FakeResponse({}, text="diff --git a/a.txt b/a.txt")
-        if path == f"{PROJECT}/issues":
+        if path == f"{PROJECT}/issues" and method == "GET":
             return FakeResponse(
                 [
                     {
@@ -224,6 +231,23 @@ class FakeHttpClient:
                 ]
             )
         if path == f"{PROJECT}/repository/branches":
+            if method == "POST":
+                return FakeResponse(
+                    {
+                        "name": (json or {}).get("branch"),
+                        "default": False,
+                        "merged": False,
+                        "protected": False,
+                        "web_url": "https://gitlab.example.com/group/project/-/tree/new",
+                        "commit": {
+                            "short_id": "ccc333",
+                            "title": "Tip",
+                            "author_name": "Oren Goldstein",
+                            "author_email": "ogoldste@example.com",
+                            "committed_date": "2026-09-20T10:00:00Z",
+                        },
+                    }
+                )
             return FakeResponse(
                 [
                     {
@@ -255,6 +279,67 @@ class FakeHttpClient:
                         },
                     },
                 ]
+            )
+        if path == "/users":
+            username = params.get("username")
+            if username == "itamir":
+                return FakeResponse([{"id": 42, "username": "itamir"}])
+            return FakeResponse([])
+        if path == f"{PROJECT}/issues" and method == "POST":
+            body = json or {}
+            return FakeResponse(
+                {
+                    "iid": 1042,
+                    "title": body.get("title"),
+                    "description": body.get("description"),
+                    "state": "opened",
+                    "author": {"username": "ogoldste"},
+                    "assignees": [{"username": "itamir"}],
+                    "labels": (body.get("labels") or "").split(",") if body.get("labels") else [],
+                    "confidential": body.get("confidential", False),
+                    "web_url": "https://gitlab.example.com/group/project/-/issues/1042",
+                    "updated_at": "2026-09-30T10:00:00Z",
+                }
+            )
+        if path == f"{PROJECT}/issues/995":
+            return FakeResponse(
+                {
+                    "iid": 995,
+                    "title": "SharedModule I3C - separate code to drivers",
+                    "confidential": False,
+                }
+            )
+        if path == f"{PROJECT}/issues/1291" and method == "PUT":
+            body = json or {}
+            return FakeResponse(
+                {
+                    "iid": 1291,
+                    "title": body.get("title", "I3C follow-ups"),
+                    "description": body.get("description", "old body"),
+                    "state": "opened",
+                    "labels": (body.get("labels") or "").split(",") if body.get("labels") else [],
+                    "web_url": "https://gitlab.example.com/group/project/-/issues/1291",
+                }
+            )
+        if path == f"{PROJECT}/uploads":
+            return FakeResponse(
+                {
+                    "alt": "shot",
+                    "url": "/uploads/abc123/shot.png",
+                    "full_path": "/group/project/uploads/abc123/shot.png",
+                    "markdown": "![shot](/uploads/abc123/shot.png)",
+                }
+            )
+        if path == f"{PROJECT}/repository/commits":
+            return FakeResponse(
+                {
+                    "id": "deadbeef" * 5,
+                    "short_id": "deadbee",
+                    "title": (json or {}).get("commit_message"),
+                    "author_name": "Oren Goldstein",
+                    "created_at": "2026-09-29T12:00:00Z",
+                    "web_url": "https://gitlab.example.com/group/project/-/commit/deadbee",
+                }
             )
         raise AssertionError(f"Unexpected path: {path}")
 
@@ -462,6 +547,16 @@ def test_write_tools_blocked_when_write_disabled() -> None:
         client.reply_to_merge_request_discussion("group/project", 12, "disc1", "hi")
     with pytest.raises(GitLabWriteDisabledError):
         client.resolve_merge_request_discussion("group/project", 12, "disc1")
+    with pytest.raises(GitLabWriteDisabledError):
+        client.create_issue("group/project", title="New issue")
+    with pytest.raises(GitLabWriteDisabledError):
+        client.create_branch("group/project", branch="topic")
+    with pytest.raises(GitLabWriteDisabledError):
+        client.update_issue("group/project", 1291, description="x")
+    with pytest.raises(GitLabWriteDisabledError):
+        client.upload_attachment("group/project", "whatever.png")
+    with pytest.raises(GitLabWriteDisabledError):
+        client.create_commit("group/project", branch="b", message="m", actions=[{"action": "create"}])
 
     assert client._client.calls == []
 
@@ -594,3 +689,198 @@ def test_list_branches_or_combines_author_and_name() -> None:
 
     assert [branch["name"] for branch in result] == ["feature/bmc-boot", "main"]
 
+
+
+def test_slugify_matches_gitlab_rules() -> None:
+    assert slugify("SharedModule I3C - separate code to drivers") == "sharedmodule-i3c-separate-code-to-drivers"
+    assert slugify("  Fix   SPI/boot (again)!  ") == "fix-spi-boot-again"
+    assert slugify("---") == ""
+
+
+def test_issue_branch_name_follows_gitlab_convention() -> None:
+    # This is the exact branch GitLab generated for the real issue 995.
+    assert (
+        issue_branch_name(995, "SharedModule I3C - separate code to drivers")
+        == "995-sharedmodule-i3c-separate-code-to-drivers"
+    )
+    assert issue_branch_name(7, "Secret", confidential=True) == "7-confidential-issue"
+    assert issue_branch_name(8, "!!!") == "8"
+    assert len(issue_branch_name(9, "x" * 400)) == len("9-") + 100
+
+
+def test_create_issue_posts_and_suggests_branch() -> None:
+    client = make_client(allow_write=True)
+    result = client.create_issue(
+        "group/project",
+        title="I3C review follow-ups",
+        description="Body text",
+        labels=["review", "i3c"],
+        assignee="itamir",
+    )
+
+    assert result["iid"] == 1042
+    assert result["suggested_branch"] == "1042-i3c-review-follow-ups"
+
+    method, path, _params, _headers, json_body = client._client.calls[-1]
+    assert (method, path) == ("POST", f"{PROJECT}/issues")
+    assert json_body == {
+        "title": "I3C review follow-ups",
+        "description": "Body text",
+        "labels": "review,i3c",
+        "assignee_ids": [42],
+    }
+
+
+def test_create_issue_omits_empty_fields() -> None:
+    client = make_client(allow_write=True)
+    client.create_issue("group/project", title="Bare")
+
+    _method, _path, _params, _headers, json_body = client._client.calls[-1]
+    assert json_body == {"title": "Bare"}
+
+
+def test_create_issue_requires_title() -> None:
+    client = make_client(allow_write=True)
+    with pytest.raises(ValueError, match="title"):
+        client.create_issue("group/project", title="   ")
+    assert client._client.calls == []
+
+
+def test_create_issue_rejects_unknown_assignee() -> None:
+    client = make_client(allow_write=True)
+    with pytest.raises(ValueError, match="no GitLab user found"):
+        client.create_issue("group/project", title="Hi", assignee="nobody")
+
+
+def test_create_branch_uses_explicit_name_and_ref() -> None:
+    client = make_client(allow_write=True)
+    result = client.create_branch("group/project", branch="oren/topic", ref="master")
+
+    assert result["name"] == "oren/topic"
+    assert result["ref"] == "master"
+
+    method, path, _params, _headers, json_body = client._client.calls[-1]
+    assert (method, path) == ("POST", f"{PROJECT}/repository/branches")
+    assert json_body == {"branch": "oren/topic", "ref": "master"}
+
+
+def test_create_branch_defaults_ref_to_project_default() -> None:
+    client = make_client(allow_write=True)
+    result = client.create_branch("group/project", branch="oren/topic")
+
+    assert result["ref"] == "main"
+    _method, _path, _params, _headers, json_body = client._client.calls[-1]
+    assert json_body == {"branch": "oren/topic", "ref": "main"}
+
+
+def test_create_branch_derives_name_from_issue() -> None:
+    client = make_client(allow_write=True)
+    result = client.create_branch("group/project", from_issue_iid=995, ref="master")
+
+    assert result["name"] == "995-sharedmodule-i3c-separate-code-to-drivers"
+    _method, _path, _params, _headers, json_body = client._client.calls[-1]
+    assert json_body["branch"] == "995-sharedmodule-i3c-separate-code-to-drivers"
+
+
+def test_create_branch_requires_a_name_source() -> None:
+    client = make_client(allow_write=True)
+    with pytest.raises(ValueError, match="from_issue_iid"):
+        client.create_branch("group/project")
+
+
+def test_update_issue_sends_only_supplied_fields() -> None:
+    client = make_client(allow_write=True)
+    client.update_issue("group/project", 1291, description="new body")
+
+    method, path, _params, _headers, json_body = client._client.calls[-1]
+    assert (method, path) == ("PUT", f"{PROJECT}/issues/1291")
+    assert json_body == {"description": "new body"}
+
+
+def test_update_issue_does_not_blank_description_when_omitted() -> None:
+    client = make_client(allow_write=True)
+    client.update_issue("group/project", 1291, title="Renamed")
+
+    _method, _path, _params, _headers, json_body = client._client.calls[-1]
+    assert "description" not in json_body
+
+
+def test_update_issue_allows_deliberate_blank_description() -> None:
+    client = make_client(allow_write=True)
+    client.update_issue("group/project", 1291, description="")
+
+    _method, _path, _params, _headers, json_body = client._client.calls[-1]
+    assert json_body == {"description": ""}
+
+
+def test_update_issue_requires_a_field_and_an_iid() -> None:
+    client = make_client(allow_write=True)
+    with pytest.raises(ValueError, match="iid"):
+        client.update_issue("group/project", 0, description="x")
+    with pytest.raises(ValueError, match="nothing to update"):
+        client.update_issue("group/project", 1291)
+    with pytest.raises(ValueError, match="state_event"):
+        client.update_issue("group/project", 1291, state_event="delete")
+
+
+def test_upload_attachment_posts_multipart(tmp_path) -> None:
+    png = tmp_path / "shot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n binary")
+    client = make_client(allow_write=True)
+
+    result = client.upload_attachment("group/project", str(png))
+
+    assert result["markdown"] == "![shot](/uploads/abc123/shot.png)"
+    method, path, _params, _headers, json_body = client._client.calls[-1]
+    assert (method, path) == ("POST", f"{PROJECT}/uploads")
+    # A multipart upload must not also carry a JSON body.
+    assert json_body is None
+    name, content, content_type = client._client.files["file"]
+    assert name == "shot.png"
+    assert content == b"\x89PNG\r\n\x1a\n binary"
+    assert content_type == "image/png"
+
+
+def test_upload_attachment_rejects_missing_file() -> None:
+    client = make_client(allow_write=True)
+    with pytest.raises(ValueError, match="file not found"):
+        client.upload_attachment("group/project", "does-not-exist.png")
+    with pytest.raises(ValueError, match="file_path is required"):
+        client.upload_attachment("group/project", "")
+
+
+def test_file_action_base64_encodes_binary(tmp_path) -> None:
+    png = tmp_path / "a.png"
+    png.write_bytes(b"\x00\x01\x02\xff")
+    action = file_action(str(png), "docs/a.png")
+
+    assert action["action"] == "create"
+    assert action["file_path"] == "docs/a.png"
+    assert action["encoding"] == "base64"
+    assert base64.b64decode(action["content"]) == b"\x00\x01\x02\xff"
+
+
+def test_file_action_rejects_missing_file() -> None:
+    with pytest.raises(ValueError, match="file not found"):
+        file_action("nope.png", "docs/nope.png")
+
+
+def test_create_commit_posts_actions() -> None:
+    client = make_client(allow_write=True)
+    actions = [{"action": "create", "file_path": "docs/a.txt", "content": "hi"}]
+    result = client.create_commit("group/project", branch="topic", message="Add docs", actions=actions)
+
+    assert result["short_id"] == "deadbee"
+    method, path, _params, _headers, json_body = client._client.calls[-1]
+    assert (method, path) == ("POST", f"{PROJECT}/repository/commits")
+    assert json_body == {"branch": "topic", "commit_message": "Add docs", "actions": actions}
+
+
+def test_create_commit_validates_arguments() -> None:
+    client = make_client(allow_write=True)
+    with pytest.raises(ValueError, match="branch is required"):
+        client.create_commit("group/project", message="m", actions=[{"action": "create"}])
+    with pytest.raises(ValueError, match="message"):
+        client.create_commit("group/project", branch="b", message="  ", actions=[{"action": "create"}])
+    with pytest.raises(ValueError, match="at least one action"):
+        client.create_commit("group/project", branch="b", message="m", actions=[])

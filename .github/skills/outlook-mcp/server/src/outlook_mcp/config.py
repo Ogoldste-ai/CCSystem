@@ -32,6 +32,17 @@ def _int_from_env(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+def default_attachment_dir() -> str:
+    """Where attachments land when the caller names no destination.
+
+    Deliberately outside the mailbox and outside any repo: attachments are
+    untrusted files that arrived by mail, and they should never be written
+    somewhere a build or a commit might pick them up by accident.
+    """
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "outlook-mcp", "attachments")
+
+
 @dataclass(slots=True)
 class OutlookConfig:
     """Runtime configuration, read from the environment.
@@ -48,6 +59,8 @@ class OutlookConfig:
     store_name: str = ""
     allow_write: bool = False
     allow_send: bool = True
+    attachment_dir: str = ""
+    max_attachment_mb: int = 20
 
     @classmethod
     def from_env(cls) -> "OutlookConfig":
@@ -64,7 +77,30 @@ class OutlookConfig:
             # Separate from allow_write so drafting can stay on while actual
             # sending is switched off. Drafts are recoverable; sends are not.
             allow_send=os.environ.get("OUTLOOK_ALLOW_SEND", "1").strip().lower() in TRUTHY,
+            # Expanded here because MCP clients commonly pass %VARS% through
+            # unexpanded in the server environment block.
+            attachment_dir=os.path.expanduser(
+                os.path.expandvars(os.environ.get("OUTLOOK_ATTACHMENT_DIR", "").strip())
+            ),
+            # Per attachment, not per message. 0 disables the cap.
+            max_attachment_mb=_int_from_env("OUTLOOK_MAX_ATTACHMENT_MB", 20, 0, 2048),
         )
+
+    def resolve_attachment_dir(self, dest_dir: str = "") -> str:
+        """Pick the destination: explicit argument, then env, then the default.
+
+        An explicit `dest_dir` is what lets a caller drop files straight into
+        its own working area - an agent session folder, say - which the server
+        cannot know about on its own.
+        """
+        for candidate in (dest_dir.strip(), self.attachment_dir):
+            if candidate:
+                return os.path.abspath(os.path.expanduser(os.path.expandvars(candidate)))
+        return os.path.abspath(default_attachment_dir())
+
+    @property
+    def max_attachment_bytes(self) -> int:
+        return self.max_attachment_mb * 1024 * 1024
 
     def problems(self) -> list[str]:
         issues: list[str] = []
@@ -75,6 +111,21 @@ class OutlookConfig:
     def require_write(self) -> None:
         if not self.allow_write:
             raise OutlookWriteDisabledError(WRITE_DISABLED_MESSAGE)
+
+    def require_attachment_write(self) -> None:
+        """Gate for saving attachments to disk.
+
+        Shares the OUTLOOK_ALLOW_WRITE switch, but says what it is actually
+        about: this writes untrusted files from your mailbox onto the
+        filesystem. It never changes the message.
+        """
+        if not self.allow_write:
+            raise OutlookWriteDisabledError(
+                "Saving attachments is disabled. Set OUTLOOK_ALLOW_WRITE=1 in the MCP "
+                "server environment and reload the client to enable it. Attachments are "
+                "files that arrived from outside, so writing them to disk is kept behind "
+                "the same switch as sending mail."
+            )
 
     def require_send(self) -> None:
         self.require_write()

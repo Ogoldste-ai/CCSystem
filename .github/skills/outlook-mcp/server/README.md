@@ -32,13 +32,15 @@ pip install -e .
 
 | Variable | Meaning |
 |---|---|
-| `OUTLOOK_ALLOW_WRITE` | `1`/`true`/`yes` enables `send_mail`, `reply(send=True)` and `mark_read`. **Default off.** |
+| `OUTLOOK_ALLOW_WRITE` | `1`/`true`/`yes` enables `send_mail`, `reply(send=True)`, `mark_read` and `save_attachments`. **Default off.** |
 | `OUTLOOK_ALLOW_SEND` | Default `1`. Set to `0` to keep writes on but forbid actual sending, leaving drafts only. |
 | `OUTLOOK_PREVIEW_CHARS` | Preview length in list results. Default `400`, clamped to 0-20000. |
 | `OUTLOOK_MAX_RESULTS` | Hard cap on rows per call. Default `50`, clamped to 1-500. |
 | `OUTLOOK_MAX_BODY_CHARS` | Cap on a single body. Default `20000`, `0` disables, clamped to 0-2000000. |
 | `OUTLOOK_LIST_RECIPIENTS` | Recipients shown per row in list results. Default `3`, `0` disables. |
 | `OUTLOOK_STORE` | Restrict to one mailbox by display name. Empty means all stores. |
+| `OUTLOOK_ATTACHMENT_DIR` | Fallback destination for `save_attachments` when the call names none. Default `%LOCALAPPDATA%\outlook-mcp\attachments`. |
+| `OUTLOOK_MAX_ATTACHMENT_MB` | Per-attachment size limit. Default `20`, `0` disables, clamped to 0-2048. |
 
 ## Tools
 
@@ -80,6 +82,12 @@ Write:
   weekly report needs in order to advance its week number.
 - `send_mail(to, subject, body, cc="", bcc="")` - needs `OUTLOOK_ALLOW_WRITE`
 - `mark_read(entry_id, read=True)` - needs `OUTLOOK_ALLOW_WRITE`
+- `save_attachments(entry_id, dest_dir="", names=[], include_inline=False, overwrite=False)`
+  - needs `OUTLOOK_ALLOW_WRITE`. Writes attachments to a directory; the message
+  itself is never modified. See [Attachments](#attachments).
+
+Attachments are also listed read-only by `list_attachments(entry_id)`, which
+reports name, size, kind and whether the entry is an inline body image.
 
 ## Design notes
 
@@ -142,6 +150,41 @@ Falling back to "mail" instead once emitted a row with every field blank, since
 every other read on that item failed too. Items with no `EntryID` are skipped
 for the same reason - nothing could be done with them later anyway.
 
+## Attachments
+
+`save_attachments` exists so a mailed file can be handed to whatever is driving
+the server - an agent's session folder, a scratch directory - without a human
+opening Outlook and clicking Save As.
+
+**The destination is the caller's choice.** The server is a separate process
+and cannot know where its client keeps working files, so `dest_dir` wins,
+`OUTLOOK_ATTACHMENT_DIR` is the fallback, and
+`%LOCALAPPDATA%\outlook-mcp\attachments` is the last resort. The default is
+deliberately outside any repository: attachments are untrusted files, and they
+should not land somewhere a build or a commit might sweep them up.
+
+**Filenames are treated as hostile.** The name is chosen by whoever sent the
+mail. `safe_filename` keeps only the basename, so `..\..\Windows\evil.dll`
+becomes `evil.dll` inside the destination, neutralises characters Windows
+forbids, and replaces reserved device names (`CON`, `LPT1`) which cannot be
+created at all. A name that sanitises to nothing becomes `attachment_<n>`.
+
+**Nothing is overwritten and nothing is silently dropped.** A collision becomes
+`report (2).pdf`, including when one message carries two attachments with the
+same name - which is why the run tracks names it has already written rather
+than only checking the filesystem. Every attachment that is *not* written
+appears in `skipped` with a reason: inline, too large, or refused by Outlook.
+A `names` entry matching no attachment comes back in `not_found`.
+
+**Inline images are skipped by default.** Signature logos are attachments too;
+they are detected through `PR_ATTACH_CONTENT_ID` and `PR_ATTACHMENT_HIDDEN` and
+excluded unless `include_inline=True`.
+
+**Gated behind `OUTLOOK_ALLOW_WRITE`.** The message is never modified, but the
+filesystem is, with content from outside the organisation - so it shares the
+switch that guards sending. The error message says so, rather than talking
+about mail.
+
 ## Tests
 
 ```powershell
@@ -149,8 +192,8 @@ cd C:\ec_accurev_git\.github\skills\outlook-mcp\server
 python -m pytest -q
 ```
 
-61 tests, no Outlook required: the COM layer is injectable and the suite drives
-it with fake folder, item and recipient objects.
+153 tests, no Outlook required: the COM layer is injectable and the suite drives
+it with fake folder, item, recipient and attachment objects.
 
 ## Troubleshooting
 

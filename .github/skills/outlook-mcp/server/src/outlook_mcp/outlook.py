@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import threading
 from datetime import datetime, timedelta
@@ -33,7 +34,83 @@ BUSY_STATUS = {0: "free", 1: "tentative", 2: "busy", 3: "out_of_office", 4: "wor
 
 OL_REQUIRED, OL_OPTIONAL = 1, 2
 
+# OlAttachmentType. olByValue is the ordinary "a file is attached" case.
+OL_BY_VALUE, OL_BY_REFERENCE, OL_EMBEDDED_ITEM, OL_OLE = 1, 4, 5, 6
+ATTACHMENT_TYPES = {
+    OL_BY_VALUE: "file",
+    OL_BY_REFERENCE: "link",
+    OL_EMBEDDED_ITEM: "embedded_item",
+    OL_OLE: "ole",
+}
+
+# PR_ATTACH_CONTENT_ID marks an image referenced from the HTML body (a
+# signature logo, typically); PR_ATTACHMENT_HIDDEN marks one Outlook does not
+# show in its own attachment list. Either means "not a document the sender
+# meant to send you".
+PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+PR_ATTACHMENT_HIDDEN = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+
+# Reserved on Windows whatever the extension, so a file called AUX.txt cannot
+# be created at all.
+RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
 _com_state = threading.local()
+
+
+def safe_filename(name: str, index: int = 0) -> str:
+    """Reduce an attachment name to something safe to create in a directory.
+
+    The name comes from the message, so it is attacker-controlled: it may hold
+    a path, traversal segments, characters Windows forbids, or a device name.
+    Only the basename survives, and a name that survives as nothing is replaced
+    rather than allowed to produce a surprising path.
+    """
+    cleaned = str(name or "").strip().replace("\\", "/")
+    cleaned = cleaned.split("/")[-1]
+    cleaned = re.sub(r'[<>:"|?*\x00-\x1f]', "_", cleaned)
+    cleaned = cleaned.strip(" .")
+    stem = cleaned.split(".")[0].upper() if cleaned else ""
+    if not cleaned or stem in RESERVED_NAMES:
+        suffix = f"_{cleaned}" if cleaned else ""
+        cleaned = f"attachment_{index or 1}{suffix}"
+    # NTFS allows 255; leave room for the " (2)" a collision may add.
+    if len(cleaned) > 200:
+        root, dot, ext = cleaned.rpartition(".")
+        cleaned = (root[:200] + dot + ext[:20]) if dot else cleaned[:200]
+    return cleaned
+
+
+def unique_path(directory: str, filename: str, used: set[str], overwrite: bool = False) -> str:
+    """Return a path in `directory` that will not clobber an existing file.
+
+    Two attachments on one message can share a name, so `used` tracks what this
+    run has already written - checking the filesystem alone would not catch it.
+    """
+    candidate = os.path.join(directory, filename)
+    if overwrite and filename.lower() not in used:
+        return candidate
+
+    root, dot, ext = filename.rpartition(".")
+    stem, extension = (root, f".{ext}") if dot else (filename, "")
+    counter = 1
+    while os.path.exists(candidate) or os.path.basename(candidate).lower() in used:
+        counter += 1
+        candidate = os.path.join(directory, f"{stem} ({counter}){extension}")
+    return candidate
+
+
+def is_inline_attachment(attachment: Any) -> bool:
+    """True for signature logos and other body-embedded images."""
+    accessor = _safe(lambda: attachment.PropertyAccessor)
+    if accessor is None:
+        return False
+    if _safe(lambda: accessor.GetProperty(PR_ATTACH_CONTENT_ID)):
+        return True
+    return bool(_safe(lambda: accessor.GetProperty(PR_ATTACHMENT_HIDDEN), False))
 
 
 def _ensure_com() -> None:
@@ -765,6 +842,128 @@ class OutlookClient:
         item.UnRead = not read
         item.Save()
         return {"entry_id": entry_id, "unread": not read}
+
+    # ------------------------------------------------------------ attachments
+
+    def _attachment_info(self, attachment: Any, index: int) -> dict[str, Any]:
+        """Describe one attachment without extracting it."""
+        raw_name = str(_safe(lambda: attachment.FileName, "") or "")
+        return {
+            "index": index,
+            "name": safe_filename(raw_name, index),
+            "original_name": raw_name,
+            "size": _as_int(_safe(lambda: attachment.Size), 0),
+            "kind": ATTACHMENT_TYPES.get(
+                _as_int(_safe(lambda: attachment.Type), OL_BY_VALUE), "unknown"
+            ),
+            "inline": is_inline_attachment(attachment),
+        }
+
+    def list_attachments(self, entry_id: str) -> list[dict[str, Any]]:
+        item = _safe(lambda: self.namespace.GetItemFromID(entry_id))
+        if item is None:
+            raise OutlookUnavailableError(
+                f"No mail item with entry_id {entry_id!r}. Entry ids come from list_messages "
+                "and change if an item is moved between stores."
+            )
+        attachments = _safe(lambda: item.Attachments)
+        count = int(_safe(lambda: attachments.Count, 0) or 0) if attachments else 0
+        found = []
+        for index in range(1, count + 1):
+            attachment = _safe(lambda i=index: attachments.Item(i))
+            if attachment is not None:
+                found.append(self._attachment_info(attachment, index))
+        return found
+
+    def save_attachments(
+        self,
+        entry_id: str,
+        dest_dir: str,
+        names: Iterable[str] = (),
+        include_inline: bool = False,
+        overwrite: bool = False,
+        max_bytes: int = 0,
+    ) -> dict[str, Any]:
+        """Write a message's attachments to `dest_dir`.
+
+        Nothing about a mail attachment is trustworthy - not the name, not the
+        size - so the filename is reduced to a safe basename before it ever
+        reaches the filesystem, and anything skipped is reported rather than
+        silently dropped.
+        """
+        item = _safe(lambda: self.namespace.GetItemFromID(entry_id))
+        if item is None:
+            raise OutlookUnavailableError(
+                f"No mail item with entry_id {entry_id!r}. Entry ids come from list_messages "
+                "and change if an item is moved between stores."
+            )
+
+        attachments = _safe(lambda: item.Attachments)
+        count = int(_safe(lambda: attachments.Count, 0) or 0) if attachments else 0
+        wanted = {str(name).strip().lower() for name in names if str(name).strip()}
+
+        os.makedirs(dest_dir, exist_ok=True)
+        saved: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        used: set[str] = set()
+
+        for index in range(1, count + 1):
+            attachment = _safe(lambda i=index: attachments.Item(i))
+            if attachment is None:
+                continue
+            info = self._attachment_info(attachment, index)
+
+            if wanted and not {
+                info["name"].lower(),
+                info["original_name"].strip().lower(),
+                str(index),
+            } & wanted:
+                continue
+            if info["inline"] and not include_inline:
+                skipped.append(dict(info, reason="inline or embedded in the message body"))
+                continue
+            if max_bytes and info["size"] > max_bytes:
+                skipped.append(
+                    dict(
+                        info,
+                        reason=(
+                            f"{info['size']} bytes exceeds the "
+                            f"{max_bytes} byte limit (OUTLOOK_MAX_ATTACHMENT_MB)"
+                        ),
+                    )
+                )
+                continue
+
+            path = unique_path(dest_dir, info["name"], used, overwrite=overwrite)
+            try:
+                attachment.SaveAsFile(path)
+            except Exception as exc:
+                skipped.append(dict(info, reason=f"Outlook refused to save it: {exc}"))
+                continue
+            used.add(os.path.basename(path).lower())
+            saved.append(
+                dict(
+                    info,
+                    path=path,
+                    size=_as_int(_safe(lambda p=path: os.path.getsize(p)), info["size"]),
+                )
+            )
+
+        missing = sorted(
+            wanted
+            - {entry["name"].lower() for entry in saved + skipped}
+            - {entry["original_name"].strip().lower() for entry in saved + skipped}
+            - {str(entry["index"]) for entry in saved + skipped}
+        )
+        return {
+            "entry_id": entry_id,
+            "subject": str(_safe(lambda: item.Subject, "") or ""),
+            "directory": dest_dir,
+            "saved": saved,
+            "skipped": skipped,
+            "not_found": missing,
+            "count": len(saved),
+        }
 
     # ---------------------------------------------------------------- writing
 

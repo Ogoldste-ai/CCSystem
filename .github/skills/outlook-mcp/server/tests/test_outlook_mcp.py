@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,11 +26,15 @@ from outlook_mcp.formatting import (  # noqa: E402
 )
 from outlook_mcp.models import MailMessage  # noqa: E402
 from outlook_mcp.outlook import (  # noqa: E402
+    PR_ATTACH_CONTENT_ID,
+    PR_ATTACHMENT_HIDDEN,
     PR_RECIPIENT_SMTP,
     PR_SENDER_SMTP,
     OutlookClient,
     gal_probes,
+    safe_filename,
     smtp_from_display_name,
+    unique_path,
 )
 from outlook_mcp.server import build_server  # noqa: E402
 
@@ -1093,6 +1098,8 @@ def test_expected_tools_are_registered():
         "list_calendar_events",
         "search_contacts",
         "mark_read",
+        "list_attachments",
+        "save_attachments",
         "create_draft",
         "send_mail",
         "reply_to_message",
@@ -1484,3 +1491,234 @@ def test_search_contacts_tool_rejects_a_blank_query():
 def test_search_contacts_is_registered_as_a_tool():
     client, config, _ = build_client()
     assert "search_contacts" in tools_of(build_server(config, client))
+
+
+# --------------------------------------------------------------- attachments
+
+
+class FakeAttachment:
+    """An attachment that can actually write itself to disk."""
+
+    def __init__(self, name, content=b"data", size=None, kind=1, content_id="", hidden=False):
+        self.FileName = name
+        self.Size = len(content) if size is None else size
+        self.Type = kind
+        self._content = content
+        properties = {}
+        if content_id:
+            properties[PR_ATTACH_CONTENT_ID] = content_id
+        if hidden:
+            properties[PR_ATTACHMENT_HIDDEN] = True
+        self.PropertyAccessor = FakeProperties(properties)
+        self.saved_to = None
+
+    def SaveAsFile(self, path):
+        self.saved_to = path
+        Path(path).write_bytes(self._content)
+
+
+def with_attachments(*attachments, entry_id="id-1"):
+    client, config, _ = build_client(allow_write=True)
+    item = client.namespace.GetItemFromID(entry_id)
+    item.Attachments = FakeCollection(list(attachments))
+    return client, config, item
+
+
+def test_safe_filename_keeps_a_normal_name():
+    assert safe_filename("TEB3_Rev_C_netlist.txt") == "TEB3_Rev_C_netlist.txt"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        r"..\..\Windows\System32\evil.dll",
+        "../../etc/passwd",
+        r"C:\Windows\System32\drivers\etc\hosts",
+    ],
+)
+def test_safe_filename_strips_paths_and_traversal(hostile):
+    # The name comes from the message, so it is attacker-controlled: whatever
+    # it says, only a bare filename may reach the filesystem.
+    cleaned = safe_filename(hostile)
+    assert "/" not in cleaned and "\\" not in cleaned
+    assert ".." not in cleaned
+    assert not os.path.isabs(cleaned)
+
+
+def test_safe_filename_replaces_illegal_and_reserved_names():
+    assert safe_filename('re:port|<1>.txt') == "re_port__1_.txt"
+    assert safe_filename("CON.txt").startswith("attachment_")
+    assert safe_filename("   ") .startswith("attachment_")
+
+
+def test_unique_path_avoids_clobbering(tmp_path):
+    (tmp_path / "report.pdf").write_bytes(b"old")
+    used: set[str] = set()
+    first = unique_path(str(tmp_path), "report.pdf", used)
+    assert Path(first).name == "report (2).pdf"
+
+
+def test_save_attachments_writes_files(tmp_path):
+    client, config, _ = with_attachments(
+        FakeAttachment("netlist.txt", b"NET"), FakeAttachment("bom.xlsx", b"BOM-DATA")
+    )
+    tools = tools_of(build_server(config, client))
+    result = tools["save_attachments"]("id-1", dest_dir=str(tmp_path))
+
+    assert result["count"] == 2
+    assert {Path(entry["path"]).name for entry in result["saved"]} == {
+        "netlist.txt",
+        "bom.xlsx",
+    }
+    assert (tmp_path / "netlist.txt").read_bytes() == b"NET"
+    assert result["saved"][1]["size"] == 8
+
+
+def test_save_attachments_skips_inline_images_by_default(tmp_path):
+    client, config, _ = with_attachments(
+        FakeAttachment("logo.png", b"PNG", content_id="image001@01D."),
+        FakeAttachment("real.pdf", b"PDF"),
+    )
+    tools = tools_of(build_server(config, client))
+
+    result = tools["save_attachments"]("id-1", dest_dir=str(tmp_path))
+    assert [entry["name"] for entry in result["saved"]] == ["real.pdf"]
+    assert result["skipped"][0]["name"] == "logo.png"
+    assert "inline" in result["skipped"][0]["reason"]
+
+    kept = tools["save_attachments"]("id-1", dest_dir=str(tmp_path), include_inline=True)
+    assert {entry["name"] for entry in kept["saved"]} == {"logo.png", "real.pdf"}
+
+
+def test_save_attachments_never_escapes_the_destination(tmp_path):
+    client, config, _ = with_attachments(
+        FakeAttachment(r"..\..\evil.dll", b"PWN")
+    )
+    tools = tools_of(build_server(config, client))
+    result = tools["save_attachments"]("id-1", dest_dir=str(tmp_path))
+
+    written = Path(result["saved"][0]["path"]).resolve()
+    assert written.parent == tmp_path.resolve()
+    assert not (tmp_path.parent.parent / "evil.dll").exists()
+
+
+def test_save_attachments_does_not_overwrite(tmp_path):
+    (tmp_path / "notes.txt").write_bytes(b"mine")
+    client, config, _ = with_attachments(FakeAttachment("notes.txt", b"theirs"))
+    tools = tools_of(build_server(config, client))
+
+    result = tools["save_attachments"]("id-1", dest_dir=str(tmp_path))
+    assert (tmp_path / "notes.txt").read_bytes() == b"mine"
+    assert Path(result["saved"][0]["path"]).name == "notes (2).txt"
+
+
+def test_save_attachments_deduplicates_repeated_names(tmp_path):
+    client, config, _ = with_attachments(
+        FakeAttachment("page.png", b"one"), FakeAttachment("page.png", b"two")
+    )
+    tools = tools_of(build_server(config, client))
+    result = tools["save_attachments"]("id-1", dest_dir=str(tmp_path))
+    names = sorted(Path(entry["path"]).name for entry in result["saved"])
+    assert names == ["page (2).png", "page.png"]
+
+
+def test_save_attachments_honours_the_size_cap(tmp_path):
+    client, config, _ = with_attachments(FakeAttachment("huge.bin", b"x", size=50 * 1024 * 1024))
+    config.max_attachment_mb = 20
+    tools = tools_of(build_server(config, client))
+
+    result = tools["save_attachments"]("id-1", dest_dir=str(tmp_path))
+    assert result["saved"] == []
+    assert "exceeds" in result["skipped"][0]["reason"]
+    assert not any(tmp_path.iterdir())
+
+
+def test_save_attachments_selects_by_name_or_index(tmp_path):
+    client, config, _ = with_attachments(
+        FakeAttachment("a.txt", b"A"), FakeAttachment("b.txt", b"B")
+    )
+    tools = tools_of(build_server(config, client))
+
+    by_name = tools["save_attachments"]("id-1", dest_dir=str(tmp_path), names=["b.txt"])
+    assert [entry["name"] for entry in by_name["saved"]] == ["b.txt"]
+
+    by_index = tools["save_attachments"]("id-1", dest_dir=str(tmp_path), names=["1"])
+    assert [entry["name"] for entry in by_index["saved"]] == ["a.txt"]
+
+
+def test_save_attachments_reports_a_name_that_is_not_there(tmp_path):
+    client, config, _ = with_attachments(FakeAttachment("a.txt", b"A"))
+    tools = tools_of(build_server(config, client))
+    result = tools["save_attachments"]("id-1", dest_dir=str(tmp_path), names=["nope.txt"])
+    assert result["not_found"] == ["nope.txt"]
+    assert result["count"] == 0
+
+
+def test_save_attachments_survives_an_unsaveable_attachment(tmp_path):
+    broken = FakeAttachment("locked.doc", b"X")
+    broken.SaveAsFile = lambda path: (_ for _ in ()).throw(RuntimeError("COM said no"))
+    client, config, _ = with_attachments(broken, FakeAttachment("ok.txt", b"OK"))
+    tools = tools_of(build_server(config, client))
+
+    result = tools["save_attachments"]("id-1", dest_dir=str(tmp_path))
+    assert [entry["name"] for entry in result["saved"]] == ["ok.txt"]
+    assert "COM said no" in result["skipped"][0]["reason"]
+
+
+def test_save_attachments_requires_the_write_gate(tmp_path):
+    client, config, _ = with_attachments(FakeAttachment("a.txt", b"A"))
+    config.allow_write = False
+    tools = tools_of(build_server(config, client))
+    with pytest.raises(OutlookWriteDisabledError):
+        tools["save_attachments"]("id-1", dest_dir=str(tmp_path))
+
+
+def test_save_attachments_rejects_a_blank_entry_id():
+    client, config, _ = build_client(allow_write=True)
+    with pytest.raises(ValueError):
+        tools_of(build_server(config, client))["save_attachments"](" ")
+
+
+def test_save_attachments_creates_a_missing_destination(tmp_path):
+    client, config, _ = with_attachments(FakeAttachment("a.txt", b"A"))
+    target = tmp_path / "nested" / "session-files"
+    tools = tools_of(build_server(config, client))
+    tools["save_attachments"]("id-1", dest_dir=str(target))
+    assert (target / "a.txt").read_bytes() == b"A"
+
+
+def test_attachment_dir_falls_back_from_argument_to_env_to_default(monkeypatch, tmp_path):
+    config = OutlookConfig(attachment_dir=str(tmp_path / "from-env"))
+    assert config.resolve_attachment_dir(str(tmp_path / "explicit")).endswith("explicit")
+    assert config.resolve_attachment_dir().endswith("from-env")
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
+    plain = OutlookConfig()
+    assert plain.resolve_attachment_dir().endswith(os.path.join("outlook-mcp", "attachments"))
+
+
+def test_list_attachments_describes_without_extracting(tmp_path):
+    inline = FakeAttachment("logo.png", b"PNG", content_id="image001")
+    client, config, _ = with_attachments(FakeAttachment("doc.pdf", b"PDF12345"), inline)
+    tools = tools_of(build_server(config, client))
+
+    found = tools["list_attachments"]("id-1")
+    assert [entry["name"] for entry in found] == ["doc.pdf", "logo.png"]
+    assert found[0]["size"] == 8
+    assert found[0]["inline"] is False
+    assert found[1]["inline"] is True
+    assert inline.saved_to is None
+
+
+def test_attachment_tools_are_registered():
+    client, config, _ = build_client()
+    names = tools_of(build_server(config, client))
+    assert "save_attachments" in names and "list_attachments" in names
+
+
+def test_health_reports_the_attachment_destination(tmp_path):
+    client, config, _ = build_client()
+    config.attachment_dir = str(tmp_path)
+    info = tools_of(build_server(config, client))["health"]()
+    assert info["attachment_dir"] == str(tmp_path)
+    assert info["max_attachment_mb"] == 20

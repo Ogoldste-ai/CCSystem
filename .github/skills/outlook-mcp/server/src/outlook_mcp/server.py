@@ -83,6 +83,8 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
             "max_results": config.max_results,
             "max_body_chars": config.max_body_chars,
             "list_recipients": config.list_recipients,
+            "attachment_dir": config.resolve_attachment_dir(),
+            "max_attachment_mb": config.max_attachment_mb,
             "problems": config.problems(),
         }
         if info["problems"]:
@@ -201,6 +203,57 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
             [_shape(raw) for raw in (by_subject + by_sender)[:capped]],
             merged,
             requested=int(limit or 0),
+        )
+
+    @server.tool()
+    def list_attachments(entry_id: str) -> list[dict[str, Any]]:
+        """List a message's attachments without extracting them.
+
+        Reports each attachment's name, size in bytes, kind, and whether it is
+        `inline` - a signature logo or other image embedded in the body rather
+        than a document the sender meant to send. Use it to decide what is
+        worth saving before calling save_attachments.
+        """
+        if not entry_id.strip():
+            raise ValueError("entry_id is required.")
+        return client.list_attachments(entry_id.strip())
+
+    @server.tool()
+    def save_attachments(
+        entry_id: str,
+        dest_dir: str = "",
+        names: list[str] | None = None,
+        include_inline: bool = False,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Save a message's attachments to a directory on this machine.
+
+        This is how you get a mailed file into your own working area: pass the
+        folder you want it in as `dest_dir` - an agent session folder, a scratch
+        directory - and the files are written there. With `dest_dir` empty the
+        server falls back to OUTLOOK_ATTACHMENT_DIR, and then to
+        %LOCALAPPDATA%\\outlook-mcp\\attachments.
+
+        By default every attachment is saved except inline images, nothing is
+        overwritten (a colliding name gains a " (2)" suffix), and anything
+        larger than OUTLOOK_MAX_ATTACHMENT_MB is skipped. Pass `names` to pick
+        specific attachments by filename or 1-based index.
+
+        Returns the absolute path and size of everything written, plus a
+        `skipped` list explaining anything that was not, so a missing file is
+        never silent. Attachment names are treated as untrusted: only the
+        basename is used, so a file can never land outside `dest_dir`.
+        """
+        if not entry_id.strip():
+            raise ValueError("entry_id is required.")
+        config.require_attachment_write()
+        return client.save_attachments(
+            entry_id.strip(),
+            dest_dir=config.resolve_attachment_dir(dest_dir),
+            names=names or [],
+            include_inline=include_inline,
+            overwrite=overwrite,
+            max_bytes=config.max_attachment_bytes,
         )
 
     @server.tool()

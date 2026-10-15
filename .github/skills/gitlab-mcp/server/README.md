@@ -13,9 +13,19 @@ and issue review workflows.
 - `list_merge_requests(...)` - summaries including reviewers, assignees, merge status
 - `get_merge_request(project, iid, include_notes=False, include_approvals=False)`
 - `get_merge_request_approvals(project, iid)`
+- `get_merge_request_review_status(project, iid)` - concise, action-oriented
+  merge readiness, approvals, unresolved discussions, head pipeline, failed jobs,
+  recovery warnings, and next actions
 - `get_merge_request_pipelines(project, iid, per_page=20)`
 - `get_pipeline_jobs(project, pipeline_id, scope="", per_page=100)`
-- `list_merge_request_discussions(project, iid, include_system=False, resolved=None, max_pages=20)`
+- `list_merge_request_discussions(project, iid, include_system=False, resolved=None, max_pages=20)` -
+  returns `{"discussions": [...], "warnings": [...]}`. GitLab's Discussions API can
+  silently omit or lag recent notes relative to the Notes API (especially around
+  bulk resolve/unresolve actions); this tool detects that via a `user_notes_count`
+  mismatch and recovers missing notes from the Notes API, reporting the gap via
+  `warnings` and tagging recovered entries `"source": "notes_fallback"` (these
+  cannot be replied to or resolved - they have no real `discussion_id`). Always
+  check `warnings` before concluding there are no unresolved comments.
 - `list_merge_request_changes(project, iid, path_filter="", include_diff=True)`
 - `get_merge_request_raw_diff(project, iid)`
 - `list_issues(...)`
@@ -27,12 +37,16 @@ All write tools raise `GitLabWriteDisabledError` unless `GITLAB_ALLOW_WRITE` is
 enabled (see **Environment**).
 
 - `create_merge_request_note(project, iid, body)` - merge request level comment
+- `update_merge_request_note(project, iid, note_id, body)` - replace a merge request comment body
+- `delete_merge_request_note(project, iid, note_id)` - permanently delete a merge request comment
 - `create_merge_request_diff_comment(project, iid, body, new_path="", new_line=None, old_path="", old_line=None, base_sha="", head_sha="", start_sha="")` - inline comment on a diff line
 - `reply_to_merge_request_discussion(project, iid, discussion_id, body)`
 - `resolve_merge_request_discussion(project, iid, discussion_id, resolved=True)`
 - `create_issue(project="", title="", description="", labels=None, assignee="", milestone_id=None, confidential=False)` - `assignee` takes usernames (comma-separated), which are resolved to ids via `GET /users`; an unknown username is an error rather than a silent drop. The result carries `suggested_branch`.
 - `create_branch(project="", branch="", ref="", from_issue_iid=None)` - omit `branch` and pass `from_issue_iid` to get GitLab's own `<iid>-<slugified-title>` name; omit `ref` to branch from the project default branch.
 - `update_issue(project="", iid, title="", description=None, labels=None, assignee="", state_event="")` - only the fields actually supplied are sent. `description` defaults to `None` rather than `""` so omitting it cannot blank an existing body; pass `""` to clear it deliberately. `state_event` is `"close"` or `"reopen"`.
+- `update_issue_note(project, iid, note_id, body)` - replace an issue comment body
+- `delete_issue_note(project, iid, note_id)` - permanently delete an issue comment
 - `upload_attachment(project="", file_path)` - multipart upload to `POST /projects/:id/uploads`; content type is sniffed with `mimetypes`. Returns `markdown`, ready to paste into an issue or comment. **The link is project-scoped** and will not render from a different project.
 - `create_commit(project="", branch, message, actions, start_branch="")` - one commit containing any number of file actions. Use the module-level `file_action(local_path, repo_path)` helper to build an action from a file on disk; it always base64-encodes, so binaries are safe.
 
@@ -40,6 +54,13 @@ enabled (see **Environment**).
 `start_sha` from the merge request when they are not supplied. GitLab rejects a
 position whose SHAs do not match the current head, and that is the most common
 cause of a failed inline comment.
+
+Use `get_merge_request_review_status` for a compact answer to “what blocks this
+MR?” It returns only the current head pipeline (with failed jobs), unresolved
+discussions, approval state, and a `next_actions` list. Use the underlying
+detail tools when the summary identifies something to investigate:
+`get_merge_request_raw_diff`, `list_merge_request_changes`,
+`list_merge_request_discussions`, or `get_pipeline_jobs`.
 
 ## Environment
 
@@ -179,15 +200,38 @@ environment, not the environment of an unrelated terminal.
 
 ## Setup for a new user
 
-1. Install the package (see **Installation**). This creates
-   `gitlab-review-mcp.exe` in your Python `Scripts` directory.
-2. Set `GITLAB_TOKEN` as a persistent user environment variable.
-3. Confirm the launcher resolves: `(Get-Command gitlab-review-mcp).Source`
-4. If that path does not match the `${userHome}` path in `.vscode\mcp.json`,
-   override the server entry in your personal VS Code user settings.
-5. For Copilot CLI, add a `gitlab-review` entry to `~\.copilot\mcp-config.json`
-   using the absolute path from step 3.
-6. Restart the client and verify by calling `health()`.
+Run the interactive Windows setup menu from this directory:
+
+```powershell
+.\tools\Setup-GitLabReviewMcp.ps1
+```
+
+Choose **5. Run the full setup** to configure the connection, install the
+package, verify GitLab access, and display the client-registration steps for
+both Copilot CLI and VS Code. The menu asks for:
+
+| Value | Required | Purpose |
+|---|---|---|
+| GitLab API URL | Yes | API v4 URL, such as `https://gitlab.example.com/api/v4`; a missing `/api/v4` suffix is added automatically. |
+| GitLab token | Yes | Personal, project, or group token with `api` scope. It is entered through a hidden prompt and saved only as a user environment variable. |
+| Default project | No | Project path such as `group/project`, used when a tool call omits `project`. |
+| Enable writes | No | Opt-in for tools that create, edit, delete, or resolve GitLab items. Defaults to disabled. |
+
+The menu does not modify Copilot CLI or VS Code configuration files. It prints
+the installed launcher path and the supported UI steps to register it, which
+prevents overwriting other user-configured MCP servers. Restart the client after
+registration so it inherits the saved environment variables.
+
+## Marketplace readiness
+
+This server can be packaged as a Copilot plugin: it has a standalone skill,
+Python package metadata, console-script entry point, and no committed secrets.
+The current `copilot-marketplace` submodule already contains a
+`shared-skill-gitlab-mcp` plugin, but it is an older copy and does not include
+the newer tools in this development skill. When explicitly promoted, copy the
+completed skill/server—including `tools\Setup-GitLabReviewMcp.ps1`—into that
+plugin, update its version and the marketplace catalogs, and validate the
+installed plugin before release.
 
 ## Troubleshooting
 

@@ -19,6 +19,12 @@ Both launch the installed `gitlab-review-mcp.exe` console script, so
 spawns its own server process; no port is opened and no server has to be started
 by hand. See `server\README.md` for setup and troubleshooting.
 
+For an interactive Windows setup menu that collects user settings, installs the
+package, tests access, and shows client-registration steps, run
+`server\tools\Setup-GitLabReviewMcp.ps1`. The GitLab token is prompted securely
+and stored only in the user's environment; the menu does not write tokens to
+client configuration files.
+
 Use this skill when you need to:
 
 - check the status of a merge request you opened: comments, pipeline, reviewers
@@ -70,9 +76,13 @@ Read:
 - `list_merge_requests(...)` - includes reviewers, assignees, and merge status
 - `get_merge_request(project, iid, include_notes=False, include_approvals=False)`
 - `get_merge_request_approvals(project, iid)`
+- `get_merge_request_review_status(project, iid)` - concise blocking state,
+  unresolved discussions, head-pipeline failures, approvals, and next actions
 - `get_merge_request_pipelines(project, iid)`
 - `get_pipeline_jobs(project, pipeline_id, scope="")`
-- `list_merge_request_discussions(project, iid, include_system=False, resolved=None)`
+- `list_merge_request_discussions(project, iid, include_system=False, resolved=None)` -
+  returns `{"discussions": [...], "warnings": [...]}`; check `warnings` for
+  notes recovered via the Notes-API fallback (see below)
 - `list_merge_request_changes(project, iid, path_filter="", include_diff=True)`
 - `get_merge_request_raw_diff(project, iid)`
 - `list_issues(...)`
@@ -81,11 +91,15 @@ Read:
 Write - all require `GITLAB_ALLOW_WRITE`:
 
 - `create_merge_request_note(project, iid, body)`
+- `update_merge_request_note(project, iid, note_id, body)`
+- `delete_merge_request_note(project, iid, note_id)`
 - `create_merge_request_diff_comment(project, iid, body, new_path, new_line, ...)`
 - `reply_to_merge_request_discussion(project, iid, discussion_id, body)`
 - `resolve_merge_request_discussion(project, iid, discussion_id, resolved=True)`
 - `create_issue(project="", title, description="", labels=None, assignee="", milestone_id=None, confidential=False)`
 - `update_issue(project="", iid, title="", description=None, labels=None, assignee="", state_event="")`
+- `update_issue_note(project, iid, note_id, body)`
+- `delete_issue_note(project, iid, note_id)`
 - `create_branch(project="", branch="", ref="", from_issue_iid=None)`
 - `upload_attachment(project="", file_path)` - returns a markdown snippet to embed
 - `create_commit(project="", branch, message, actions, start_branch="")`
@@ -99,7 +113,12 @@ Write - all require `GITLAB_ALLOW_WRITE`:
    `detailed_merge_status` / `has_conflicts` show whether it can merge.
 3. `list_merge_request_discussions(iid)` to read the comments. This is threaded,
    covers every page, and hides system notes; use `resolved=False` to see only
-   the threads still waiting on a response.
+   the threads still waiting on a response. GitLab's Discussions API can
+   silently drop recent comments (especially right after a bulk resolve), so
+   always check the returned `warnings` list - a non-empty list means some
+   notes were recovered from the Notes API and are marked
+   `"source": "notes_fallback"` because they can't be replied to or resolved
+   directly.
 4. `get_merge_request_approvals(iid)` for who approved, when the instance
    supports approvals.
 5. If the pipeline failed, `get_pipeline_jobs(pipeline_id, scope="failed")` names
@@ -221,8 +240,11 @@ transport.
 - TLS verification uses the Windows certificate store via `truststore`, which is
   what allows the internal GitLab certificate to validate without a PEM bundle.
 - `list_merge_request_discussions()` paginates fully and is the right tool for
-  reading review comments. `get_merge_request(include_notes=True)` and
-  `get_issue(include_notes=True)` still return only the first page of raw notes.
+  reading review comments, and it now self-checks against `user_notes_count`
+  and falls back to the fully-paginated Notes API when the Discussions API
+  under-reports - check its `warnings` list. `get_merge_request(include_notes=True)`
+  and `get_issue(include_notes=True)` still return only the first page of raw
+  notes.
 - Inline comments are anchored to the merge request `diff_refs`. Those are
   fetched automatically, but a new push invalidates them, so re-read
   `list_merge_request_changes()` before commenting on a busy merge request.

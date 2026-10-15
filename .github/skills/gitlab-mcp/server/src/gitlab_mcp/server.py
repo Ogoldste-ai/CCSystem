@@ -107,6 +107,17 @@ def build_server() -> FastMCP:
         return client.get_merge_request_approvals(project=project, iid=iid)
 
     @server.tool()
+    def get_merge_request_review_status(project: str, iid: int) -> dict[str, Any]:
+        """Concise, action-oriented status of a merge request.
+
+        Combines merge readiness, approvals, unresolved discussions, the head
+        pipeline, and failed jobs. The result preserves discussion warnings and
+        includes identifiers needed to reply, edit/delete notes, or resolve a
+        discussion. This is read-only.
+        """
+        return client.get_merge_request_review_status(project=project, iid=iid)
+
+    @server.tool()
     def get_merge_request_pipelines(project: str, iid: int, per_page: int = 20) -> list[dict[str, Any]]:
         """Pipeline status for a merge request, newest pipeline first."""
         return client.get_merge_request_pipelines(project=project, iid=iid, per_page=per_page)
@@ -137,13 +148,23 @@ def build_server() -> FastMCP:
         include_system: bool = False,
         resolved: bool | None = None,
         max_pages: int = 20,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Read the comments on a merge request as threaded discussions.
 
         Fetches every page, keeps thread structure, reports resolved state and the
         file/line each inline comment is anchored to. System notes such as "added 1
         commit" are excluded unless include_system is true. Pass resolved=false to
         see only threads that still need attention.
+
+        Returns {"discussions": [...], "warnings": [...]}. GitLab's Discussions API
+        can silently omit or lag recent notes relative to the Notes API, especially
+        around bulk resolve/unresolve actions; when that's detected, missing notes
+        are recovered from the Notes API and reported here with non-empty
+        `warnings`. Recovered entries are tagged "source": "notes_fallback" because
+        their file/line grouping is approximate and they have no real
+        discussion_id - they cannot be replied to or resolved via
+        reply_to_merge_request_discussion / resolve_merge_request_discussion. Check
+        `warnings` before concluding a merge request has no unresolved comments.
         """
         return client.list_merge_request_discussions(
             project=project,
@@ -186,6 +207,21 @@ def build_server() -> FastMCP:
     def create_merge_request_note(project: str, iid: int, body: str) -> dict[str, Any]:
         """Post a merge request level comment. Requires GITLAB_ALLOW_WRITE=1."""
         return client.create_merge_request_note(project=project, iid=iid, body=body)
+
+    @server.tool()
+    def update_merge_request_note(project: str, iid: int, note_id: int, body: str) -> dict[str, Any]:
+        """Replace a merge-request comment. Requires GITLAB_ALLOW_WRITE=1.
+
+        Take note_id from list_merge_request_discussions or
+        get_merge_request(include_notes=true). This permanently replaces the
+        previous body.
+        """
+        return client.update_merge_request_note(project=project, iid=iid, note_id=note_id, body=body)
+
+    @server.tool()
+    def delete_merge_request_note(project: str, iid: int, note_id: int) -> dict[str, Any]:
+        """Permanently delete a merge-request comment. Requires GITLAB_ALLOW_WRITE=1."""
+        return client.delete_merge_request_note(project=project, iid=iid, note_id=note_id)
 
     @server.tool()
     def create_merge_request_diff_comment(
@@ -277,6 +313,20 @@ def build_server() -> FastMCP:
     @server.tool()
     def get_issue(project: str, iid: int, include_notes: bool = False) -> dict[str, Any]:
         return client.get_issue(project=project, iid=iid, include_notes=include_notes)
+
+    @server.tool()
+    def update_issue_note(project: str, iid: int, note_id: int, body: str) -> dict[str, Any]:
+        """Replace an issue comment. Requires GITLAB_ALLOW_WRITE=1.
+
+        Take note_id from get_issue(include_notes=true). This permanently
+        replaces the previous body.
+        """
+        return client.update_issue_note(project=project, iid=iid, note_id=note_id, body=body)
+
+    @server.tool()
+    def delete_issue_note(project: str, iid: int, note_id: int) -> dict[str, Any]:
+        """Permanently delete an issue comment. Requires GITLAB_ALLOW_WRITE=1."""
+        return client.delete_issue_note(project=project, iid=iid, note_id=note_id)
 
     @server.tool()
     def create_issue(

@@ -20,10 +20,11 @@ DIFF_REFS = {"base_sha": "base1", "head_sha": "head1", "start_sha": "start1"}
 
 
 class FakeResponse:
-    def __init__(self, payload, text: str = "", status_code: int = 200) -> None:
+    def __init__(self, payload, text: str = "", status_code: int = 200, headers: dict | None = None) -> None:
         self._payload = payload
         self.text = text
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -54,7 +55,11 @@ class FakeHttpClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict, dict, dict | None]] = []
         self.discussion_pages: dict[int, list] = {}
+        self.notes_pages: dict[int, list] = {}
+        self.user_notes_count_override: int | None = None
+        self.next_page_headers: dict[tuple[str, int], str] = {}
         self.collapse_diffs = False
+        self.no_head_pipeline = False
         self.files = None
 
     def request(self, method: str, path: str, params=None, json=None, headers=None, files=None):
@@ -107,7 +112,7 @@ class FakeHttpClient:
                     "author": {"username": "alice", "name": "Alice", "avatar_url": "x"},
                     "reviewers": [{"username": "carol", "name": "Carol", "avatar_url": "x"}],
                     "assignees": [{"username": "dave", "name": "Dave", "avatar_url": "x"}],
-                    "head_pipeline": {
+                    "head_pipeline": None if self.no_head_pipeline else {
                         "id": 900,
                         "status": "failed",
                         "ref": "fix/spi",
@@ -117,7 +122,9 @@ class FakeHttpClient:
                     "detailed_merge_status": "mergeable",
                     "has_conflicts": False,
                     "blocking_discussions_resolved": False,
-                    "user_notes_count": 3,
+                    "user_notes_count": self.user_notes_count_override
+                    if self.user_notes_count_override is not None
+                    else 3,
                     "changes_count": "2",
                     "diff_refs": DIFF_REFS,
                     "sha": "abc123",
@@ -170,7 +177,8 @@ class FakeHttpClient:
                     }
                 )
             page = int(params.get("page", 1))
-            return FakeResponse(self.discussion_pages.get(page, []))
+            header = self.next_page_headers.get(("discussions", page), "")
+            return FakeResponse(self.discussion_pages.get(page, []), headers={"X-Next-Page": header} if header else {})
         if path == f"{PROJECT}/merge_requests/12/discussions/disc1":
             return FakeResponse(
                 {
@@ -181,8 +189,16 @@ class FakeHttpClient:
             )
         if path == f"{PROJECT}/merge_requests/12/discussions/disc1/notes":
             return FakeResponse(_note(3001, json["body"]))
+        if path == f"{PROJECT}/merge_requests/12/notes" and method == "GET":
+            page = int(params.get("page", 1))
+            header = self.next_page_headers.get(("notes", page), "")
+            return FakeResponse(self.notes_pages.get(page, []), headers={"X-Next-Page": header} if header else {})
         if path == f"{PROJECT}/merge_requests/12/notes":
             return FakeResponse(_note(2001, json["body"]))
+        if path == f"{PROJECT}/merge_requests/12/notes/2001" and method == "PUT":
+            return FakeResponse(_note(2001, json["body"]))
+        if path == f"{PROJECT}/merge_requests/12/notes/2001" and method == "DELETE":
+            return FakeResponse({})
         if path == f"{PROJECT}/merge_requests/12/changes":
             return FakeResponse(
                 {
@@ -321,6 +337,10 @@ class FakeHttpClient:
                     "web_url": "https://gitlab.example.com/group/project/-/issues/1291",
                 }
             )
+        if path == f"{PROJECT}/issues/1291/notes/3001" and method == "PUT":
+            return FakeResponse(_note(3001, json["body"]))
+        if path == f"{PROJECT}/issues/1291/notes/3001" and method == "DELETE":
+            return FakeResponse({})
         if path == f"{PROJECT}/uploads":
             return FakeResponse(
                 {
@@ -412,6 +432,68 @@ def test_get_merge_request_approvals_degrades_on_404() -> None:
     assert "Premium" in result["reason"]
 
 
+def test_get_merge_request_review_status_summarizes_blockers() -> None:
+    client = make_client()
+    client._client.user_notes_count_override = 1
+    client._client.discussion_pages = {
+        1: [
+            {
+                "id": "disc1",
+                "individual_note": False,
+                "notes": [
+                    _note(
+                        101,
+                        "Please rename",
+                        resolvable=True,
+                        resolved=False,
+                        position={"new_path": "EC/spi.c", "new_line": 10},
+                    )
+                ],
+            }
+        ]
+    }
+
+    result = client.get_merge_request_review_status("group/project", 12)
+
+    assert result["project"] == "group/project"
+    assert result["merge_request"]["iid"] == 12
+    assert "description" not in result["merge_request"]
+    assert result["approvals"]["supported"] is False
+    assert result["pipeline"]["id"] == 900
+    assert [job["name"] for job in result["failed_jobs"]] == ["build-ec"]
+    assert result["unresolved_discussions"]["count"] == 1
+    assert result["unresolved_discussions"]["items"][0]["notes"][0]["id"] == 101
+    assert result["warnings"] == []
+    assert result["next_actions"] == [
+        "Reply to or resolve the remaining discussion threads.",
+        "Investigate the failed pipeline jobs.",
+    ]
+
+
+def test_get_merge_request_review_status_reports_missing_pipeline() -> None:
+    client = make_client()
+    client._client.no_head_pipeline = True
+    client._client.user_notes_count_override = 0
+
+    result = client.get_merge_request_review_status("group/project", 12)
+
+    assert result["pipeline"] is None
+    assert result["failed_jobs"] == []
+    assert result["next_actions"] == ["No head pipeline is available for this merge request."]
+
+
+def test_get_merge_request_review_status_preserves_discussion_warnings() -> None:
+    client = make_client()
+    client._client.user_notes_count_override = 1
+    client._client.discussion_pages = {1: []}
+    client._client.notes_pages = {1: [_note(101, "Missing discussion note")]}
+
+    result = client.get_merge_request_review_status("group/project", 12)
+
+    assert result["unresolved_discussions"]["count"] == 1
+    assert result["warnings"]
+
+
 def test_get_merge_request_pipelines_trims_fields() -> None:
     client = make_client()
     result = client.get_merge_request_pipelines("group/project", 12)
@@ -455,9 +537,12 @@ def test_discussions_paginate_and_drop_system_notes() -> None:
         {"id": f"pad{i}", "individual_note": True, "notes": [_note(200 + i, "pad")]} for i in range(98)
     ]
     client._client.discussion_pages = {1: real + padding, 2: []}
+    client._client.user_notes_count_override = 99  # 1 real + 98 padding non-system notes
 
-    result = client.list_merge_request_discussions("group/project", 12)
+    outcome = client.list_merge_request_discussions("group/project", 12)
+    result = outcome["discussions"]
 
+    assert outcome["warnings"] == []
     assert result[0]["id"] == "disc1"
     assert result[0]["file"] == "EC/spi.c"
     assert result[0]["resolved"] is False
@@ -477,13 +562,77 @@ def test_discussions_include_system_and_resolved_filter() -> None:
             {"id": "sys1", "individual_note": True, "notes": [_note(103, "added 1 commit", system=True)]},
         ]
     }
+    client._client.user_notes_count_override = 2  # notes 101 and 102 are the only non-system notes
 
-    assert [d["id"] for d in client.list_merge_request_discussions("group/project", 12, include_system=True)] == [
+    assert [
+        d["id"]
+        for d in client.list_merge_request_discussions("group/project", 12, include_system=True)["discussions"]
+    ] == [
         "disc1",
         "disc2",
         "sys1",
     ]
-    assert [d["id"] for d in client.list_merge_request_discussions("group/project", 12, resolved=False)] == ["disc2"]
+    assert [
+        d["id"] for d in client.list_merge_request_discussions("group/project", 12, resolved=False)["discussions"]
+    ] == ["disc2"]
+
+
+def test_discussions_recovers_notes_missing_from_discussions_api() -> None:
+    """Regression test for the Discussions API silently under-reporting notes.
+
+    Reproduces the incident where `/discussions` returned a stale set (missing
+    several recent notes) while `/notes` had everything, discovered on a live
+    merge request. The tool must detect the `user_notes_count` mismatch,
+    recover the missing notes from the Notes API, and report the gap via
+    `warnings` rather than silently returning an incomplete result.
+    """
+    client = make_client()
+    client._client.discussion_pages = {
+        1: [
+            {"id": "disc1", "individual_note": False, "notes": [_note(101, "Please rename", resolvable=True, resolved=False)]},
+        ]
+    }
+    # The Discussions API only knows about note 101 (1 user note), but the merge
+    # request reports 3 user notes - 2 recent ones (102, 103) are missing, matching
+    # the live incident where comments posted after a bulk-resolve never appeared.
+    client._client.user_notes_count_override = 3
+    client._client.notes_pages = {
+        1: [
+            _note(101, "Please rename", resolvable=True, resolved=False),
+            _note(
+                102,
+                "Why is this global?",
+                resolvable=True,
+                resolved=False,
+                position={"new_path": "EC/Common/ChipAPIs/HFCG.h", "new_line": 40},
+            ),
+            _note(
+                103,
+                "Please add a comment here",
+                resolvable=True,
+                resolved=False,
+                position={"new_path": "EC/Common/ChipAPIs/I3C.cpp", "new_line": 12},
+            ),
+        ]
+    }
+
+    outcome = client.list_merge_request_discussions("group/project", 12)
+
+    assert outcome["warnings"], "a shortfall must be reported, not silently fixed"
+    recovered_ids = {
+        discussion["id"]: discussion
+        for discussion in outcome["discussions"]
+        if discussion.get("source") == "notes_fallback"
+    }
+    assert len(recovered_ids) == 2
+    recovered_bodies = {note["body"] for discussion in recovered_ids.values() for note in discussion["notes"]}
+    assert recovered_bodies == {"Why is this global?", "Please add a comment here"}
+
+    # The real discussion from the Discussions API is still present and unaffected.
+    assert any(d["id"] == "disc1" for d in outcome["discussions"])
+
+    notes_calls = [params["page"] for _m, path, params, _h, _j in client._client.calls if path.endswith("/notes")]
+    assert notes_calls == [1]
 
 
 def test_list_merge_request_changes_returns_diff_refs_and_files() -> None:
@@ -542,6 +691,10 @@ def test_write_tools_blocked_when_write_disabled() -> None:
     with pytest.raises(GitLabWriteDisabledError, match="GITLAB_ALLOW_WRITE"):
         client.create_merge_request_note("group/project", 12, "hello")
     with pytest.raises(GitLabWriteDisabledError):
+        client.update_merge_request_note("group/project", 12, 2001, "replacement")
+    with pytest.raises(GitLabWriteDisabledError):
+        client.delete_merge_request_note("group/project", 12, 2001)
+    with pytest.raises(GitLabWriteDisabledError):
         client.create_merge_request_diff_comment("group/project", 12, "hi", new_path="EC/spi.c", new_line=10)
     with pytest.raises(GitLabWriteDisabledError):
         client.reply_to_merge_request_discussion("group/project", 12, "disc1", "hi")
@@ -553,6 +706,10 @@ def test_write_tools_blocked_when_write_disabled() -> None:
         client.create_branch("group/project", branch="topic")
     with pytest.raises(GitLabWriteDisabledError):
         client.update_issue("group/project", 1291, description="x")
+    with pytest.raises(GitLabWriteDisabledError):
+        client.update_issue_note("group/project", 1291, 3001, "replacement")
+    with pytest.raises(GitLabWriteDisabledError):
+        client.delete_issue_note("group/project", 1291, 3001)
     with pytest.raises(GitLabWriteDisabledError):
         client.upload_attachment("group/project", "whatever.png")
     with pytest.raises(GitLabWriteDisabledError):
@@ -570,6 +727,37 @@ def test_create_merge_request_note_posts_json_body() -> None:
     assert method == "POST"
     assert path == f"{PROJECT}/merge_requests/12/notes"
     assert json_body == {"body": "Looks good"}
+
+
+def test_update_and_delete_merge_request_note() -> None:
+    client = make_client(allow_write=True)
+
+    updated = client.update_merge_request_note("group/project", 12, 2001, "Rewritten")
+    assert updated["id"] == 2001
+    assert updated["body"] == "Rewritten"
+    method, path, _params, _headers, json_body = client._client.calls[-1]
+    assert (method, path, json_body) == ("PUT", f"{PROJECT}/merge_requests/12/notes/2001", {"body": "Rewritten"})
+
+    deleted = client.delete_merge_request_note("group/project", 12, 2001)
+    assert deleted == {
+        "deleted": True,
+        "project": "group/project",
+        "merge_request_iid": 12,
+        "note_id": 2001,
+    }
+    method, path, _params, _headers, _json_body = client._client.calls[-1]
+    assert (method, path) == ("DELETE", f"{PROJECT}/merge_requests/12/notes/2001")
+
+
+def test_note_operations_require_positive_note_id_and_nonempty_body() -> None:
+    client = make_client(allow_write=True)
+
+    with pytest.raises(ValueError, match="note_id"):
+        client.update_merge_request_note("group/project", 12, 0, "replacement")
+    with pytest.raises(ValueError, match="non-empty"):
+        client.update_issue_note("group/project", 1291, 3001, "  ")
+    with pytest.raises(ValueError, match="note_id"):
+        client.delete_issue_note("group/project", 1291, -1)
 
 
 def test_create_diff_comment_autofills_shas() -> None:
@@ -811,6 +999,26 @@ def test_update_issue_allows_deliberate_blank_description() -> None:
 
     _method, _path, _params, _headers, json_body = client._client.calls[-1]
     assert json_body == {"description": ""}
+
+
+def test_update_and_delete_issue_note() -> None:
+    client = make_client(allow_write=True)
+
+    updated = client.update_issue_note("group/project", 1291, 3001, "Rewritten")
+    assert updated["id"] == 3001
+    assert updated["body"] == "Rewritten"
+    method, path, _params, _headers, json_body = client._client.calls[-1]
+    assert (method, path, json_body) == ("PUT", f"{PROJECT}/issues/1291/notes/3001", {"body": "Rewritten"})
+
+    deleted = client.delete_issue_note("group/project", 1291, 3001)
+    assert deleted == {
+        "deleted": True,
+        "project": "group/project",
+        "issue_iid": 1291,
+        "note_id": 3001,
+    }
+    method, path, _params, _headers, _json_body = client._client.calls[-1]
+    assert (method, path) == ("DELETE", f"{PROJECT}/issues/1291/notes/3001")
 
 
 def test_update_issue_requires_a_field_and_an_iid() -> None:

@@ -223,6 +223,76 @@ class GitLabClient:
                 return None
             raise
 
+    def _request_page(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[Any, str]:
+        """Like `_request`, but also returns GitLab's `X-Next-Page` header.
+
+        Used by paginated collection fetches that need to cross-check GitLab's
+        own "is there another page" signal against the simpler
+        "chunk shorter than per_page" heuristic, since offset pagination on
+        notes/discussions collections has known staleness issues (see
+        `_paginate_collection`).
+        """
+        headers = {"Accept": "application/json"}
+        try:
+            response = self._client.request(
+                method,
+                path,
+                params=self._clean_params(params or {}),
+                json=None,
+                headers=headers,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise GitLabApiError.from_response(method, path, exc.response) from exc
+        next_page = str(getattr(response, "headers", {}).get("X-Next-Page", "") or "")
+        return response.json(), next_page
+
+    def _paginate_collection(
+        self,
+        path: str,
+        *,
+        max_pages: int = 20,
+        per_page: int = 100,
+    ) -> tuple[list[Any], list[str]]:
+        """Fetch every page of a GitLab offset-paginated collection endpoint.
+
+        Termination relies primarily on GitLab's `X-Next-Page` response header,
+        falling back to "chunk shorter than per_page" only when the header is
+        absent, because offset pagination on notes/discussions collections has
+        been known to report an empty/short page before all pages are actually
+        read (see https://docs.gitlab.com/ee/api/discussions.html and
+        community reports of comments going missing from this endpoint).
+        A mismatch between the two signals is recorded as a warning rather
+        than silently trusted either way.
+        """
+        items: list[Any] = []
+        warnings: list[str] = []
+        for current_page in range(1, max_pages + 1):
+            chunk, next_page_header = self._request_page(
+                "GET",
+                path,
+                params={"page": current_page, "per_page": per_page},
+            )
+            items.extend(chunk)
+            header_says_more = bool(next_page_header)
+            chunk_says_more = len(chunk) >= per_page
+            if header_says_more and not chunk_says_more:
+                warnings.append(
+                    f"{path}: page {current_page} returned only {len(chunk)} item(s) "
+                    f"(< per_page={per_page}), but GitLab's X-Next-Page header still "
+                    "pointed to another page; continued paginating instead of "
+                    "stopping early."
+                )
+            if not (header_says_more or chunk_says_more):
+                break
+        return items, warnings
+
     def _require_write(self) -> None:
         if not self.config.allow_write:
             raise GitLabWriteDisabledError(WRITE_DISABLED_MESSAGE)
@@ -233,6 +303,12 @@ class GitLabClient:
         if not text:
             raise ValueError("body must be a non-empty comment string")
         return text
+
+    @staticmethod
+    def _require_note_id(note_id: int) -> int:
+        if note_id <= 0:
+            raise ValueError("note_id must be a positive integer")
+        return note_id
 
     def health(self) -> dict[str, Any]:
         user = self._request("GET", "/user")
@@ -556,6 +632,71 @@ class GitLabClient:
             "user_can_approve": payload.get("user_can_approve"),
         }
 
+    def get_merge_request_review_status(self, project: str, iid: int) -> dict[str, Any]:
+        """Return the actionable review state of one merge request.
+
+        This intentionally composes the existing detailed tools rather than
+        replacing them: callers still use those tools when they need the full
+        description, all pipelines, or unfiltered discussions.
+        """
+        merge_request = self.get_merge_request(project, iid)
+        project_value = self._resolve_project_value(project)
+        approvals = self.get_merge_request_approvals(project_value, iid)
+        discussion_result = self.list_merge_request_discussions(project_value, iid, resolved=False)
+        unresolved_discussions = discussion_result["discussions"]
+        pipeline = merge_request["head_pipeline"]
+        failed_jobs: list[dict[str, Any]] = []
+        if pipeline and pipeline.get("status") == "failed" and pipeline.get("id") is not None:
+            failed_jobs = self.get_pipeline_jobs(project_value, pipeline["id"], scope="failed")
+
+        next_actions: list[str] = []
+        if merge_request["has_conflicts"]:
+            next_actions.append("Resolve merge conflicts.")
+        if merge_request["detailed_merge_status"] == "discussions_not_resolved" or unresolved_discussions:
+            next_actions.append("Reply to or resolve the remaining discussion threads.")
+        if pipeline and pipeline.get("status") == "failed":
+            next_actions.append("Investigate the failed pipeline jobs.")
+        if pipeline is None:
+            next_actions.append("No head pipeline is available for this merge request.")
+        if approvals.get("supported") and not approvals.get("approved"):
+            approvals_left = approvals.get("approvals_left")
+            if approvals_left:
+                next_actions.append(f"Obtain {approvals_left} remaining approval(s).")
+            else:
+                next_actions.append("Obtain the required approvals.")
+        if not next_actions:
+            next_actions.append("No blocking review action is currently reported.")
+
+        return {
+            "project": project_value,
+            "merge_request": {
+                "iid": merge_request["iid"],
+                "title": merge_request["title"],
+                "state": merge_request["state"],
+                "draft": merge_request["draft"],
+                "web_url": merge_request["web_url"],
+                "source_branch": merge_request["source_branch"],
+                "target_branch": merge_request["target_branch"],
+                "updated_at": merge_request["updated_at"],
+                "author": merge_request["author"],
+                "assignees": merge_request["assignees"],
+                "reviewers": merge_request["reviewers"],
+                "merge_status": merge_request["merge_status"],
+                "detailed_merge_status": merge_request["detailed_merge_status"],
+                "has_conflicts": merge_request["has_conflicts"],
+                "blocking_discussions_resolved": merge_request["blocking_discussions_resolved"],
+            },
+            "approvals": approvals,
+            "pipeline": pipeline,
+            "failed_jobs": failed_jobs,
+            "unresolved_discussions": {
+                "count": len(unresolved_discussions),
+                "items": unresolved_discussions,
+            },
+            "warnings": discussion_result["warnings"],
+            "next_actions": next_actions,
+        }
+
     def get_merge_request_pipelines(self, project: str, iid: int, *, per_page: int = 20) -> list[dict[str, Any]]:
         """Pipelines that ran for a merge request, newest first."""
         project_value = self._resolve_project_value(project)
@@ -594,26 +735,78 @@ class GitLabClient:
         include_system: bool = False,
         resolved: bool | None = None,
         max_pages: int = 20,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Threaded merge request discussions across every page.
 
         System notes ("added 1 commit", "assigned to @user") are dropped unless
         `include_system` is set, because they bury the human review comments.
         `resolved=False` returns only threads still needing attention.
+
+        GitLab's Discussions API has a known class of bug where it silently
+        omits or staleness-lags recently added notes relative to the plain
+        Notes API (`/merge_requests/:iid/notes`), especially around bulk
+        resolve/unresolve actions. To guard against that, this method
+        cross-checks the merge request's `user_notes_count` against the
+        non-system notes it actually collected; on a shortfall it falls back
+        to the Notes API to recover the missing notes and reports what
+        happened via the returned `warnings` list. Recovered notes are
+        grouped into synthetic threads (consecutive notes sharing the same
+        type/file/line) tagged `"source": "notes_fallback"` because the Notes
+        API does not expose a real `discussion_id` - these entries cannot be
+        replied to or resolved via `reply_to_merge_request_discussion` /
+        `resolve_merge_request_discussion`.
+
+        Returns `{"discussions": [...], "warnings": [...]}`. `warnings` is
+        empty when the Discussions API returned a complete set.
         """
         project_value = self._resolve_project_value(project)
         encoded = self._encode_project(project_value)
 
-        raw: list[dict[str, Any]] = []
-        for current_page in range(1, max_pages + 1):
-            chunk = self._request(
-                "GET",
-                f"/projects/{encoded}/merge_requests/{iid}/discussions",
-                params={"page": current_page, "per_page": 100},
+        raw, warnings = self._paginate_collection(
+            f"/projects/{encoded}/merge_requests/{iid}/discussions",
+            max_pages=max_pages,
+        )
+
+        seen_note_ids: set[int] = set()
+        collected_user_notes = 0
+        for item in raw:
+            for note in item.get("notes") or []:
+                note_id = note.get("id")
+                if note_id is not None:
+                    seen_note_ids.add(note_id)
+                if not note.get("system"):
+                    collected_user_notes += 1
+
+        mr = self._request("GET", f"/projects/{encoded}/merge_requests/{iid}")
+        expected_user_notes = mr.get("user_notes_count")
+        synthetic: list[dict[str, Any]] = []
+        if isinstance(expected_user_notes, int) and expected_user_notes > collected_user_notes:
+            missing = expected_user_notes - collected_user_notes
+            warnings.append(
+                f"Discussions API returned {collected_user_notes} user note(s) but the merge "
+                f"request reports {expected_user_notes}; {missing} note(s) appear missing. "
+                "Falling back to the Notes API to recover them."
             )
-            raw.extend(chunk)
-            if len(chunk) < 100:
-                break
+            notes, notes_warnings = self._paginate_collection(
+                f"/projects/{encoded}/merge_requests/{iid}/notes",
+                max_pages=max_pages,
+            )
+            warnings.extend(notes_warnings)
+            recovered = [note for note in notes if note.get("id") not in seen_note_ids]
+            if recovered:
+                warnings.append(
+                    f"Recovered {len(recovered)} note(s) from the Notes API that were missing "
+                    "from the Discussions API. These are reported as synthetic, approximate "
+                    "threads (source=notes_fallback) and cannot be replied to or resolved "
+                    "through the discussion-reply tools."
+                )
+                synthetic = self._group_notes_into_synthetic_discussions(recovered)
+            else:
+                warnings.append(
+                    "Could not locate the missing note(s) via the Notes API either; the "
+                    "user_notes_count mismatch may be due to deleted notes or a GitLab "
+                    "counting quirk rather than missing data."
+                )
 
         discussions: list[dict[str, Any]] = []
         for item in raw:
@@ -626,7 +819,53 @@ class GitLabClient:
             if resolved is not None and bool(formatted["resolved"]) is not resolved:
                 continue
             discussions.append(formatted)
-        return discussions
+        for item in synthetic:
+            notes = item.get("notes") or []
+            if not include_system:
+                notes = [note for note in notes if not note.get("system")]
+            if not notes:
+                continue
+            formatted = self._format_discussion(item, notes)
+            formatted["source"] = "notes_fallback"
+            if resolved is not None and bool(formatted["resolved"]) is not resolved:
+                continue
+            discussions.append(formatted)
+        return {"discussions": discussions, "warnings": warnings}
+
+    @staticmethod
+    def _note_group_key(note: dict[str, Any]) -> tuple[Any, ...]:
+        position = note.get("position") or {}
+        return (
+            bool(note.get("system")),
+            position.get("new_path"),
+            position.get("old_path"),
+            position.get("new_line"),
+            position.get("old_line"),
+        )
+
+    @classmethod
+    def _group_notes_into_synthetic_discussions(cls, notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Group consecutive recovered notes that look like the same thread.
+
+        The Notes API returns a flat, chronologically ordered list with no
+        `discussion_id`, so exact thread membership can't be reconstructed.
+        Grouping consecutive notes sharing the same (system flag, file,
+        line) approximates the original discussion threads, mirroring the
+        manual heuristic used when this gap was first discovered.
+        """
+        groups: list[list[dict[str, Any]]] = []
+        current_key: tuple[Any, ...] | None = None
+        for note in notes:
+            key = cls._note_group_key(note)
+            if groups and key == current_key:
+                groups[-1].append(note)
+            else:
+                groups.append([note])
+                current_key = key
+        return [
+            {"id": f"notes_fallback:{group[0].get('id')}", "individual_note": len(group) == 1, "notes": group}
+            for group in groups
+        ]
 
     def list_merge_request_changes(
         self,
@@ -707,6 +946,40 @@ class GitLabClient:
             json_body={"body": text},
         )
         return self._format_note(payload)
+
+    def update_merge_request_note(
+        self,
+        project: str,
+        iid: int,
+        note_id: int,
+        body: str,
+    ) -> dict[str, Any]:
+        """Replace the body of a merge request note."""
+        self._require_write()
+        text = self._require_body(body)
+        self._require_note_id(note_id)
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+        payload = self._request(
+            "PUT",
+            f"/projects/{encoded}/merge_requests/{iid}/notes/{note_id}",
+            json_body={"body": text},
+        )
+        return self._format_note(payload)
+
+    def delete_merge_request_note(self, project: str, iid: int, note_id: int) -> dict[str, Any]:
+        """Permanently delete a merge request note."""
+        self._require_write()
+        self._require_note_id(note_id)
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+        self._request("DELETE", f"/projects/{encoded}/merge_requests/{iid}/notes/{note_id}")
+        return {
+            "deleted": True,
+            "project": project_value,
+            "merge_request_iid": iid,
+            "note_id": note_id,
+        }
 
     def create_merge_request_diff_comment(
         self,
@@ -886,6 +1159,40 @@ class GitLabClient:
         if include_notes:
             result["notes"] = self._request("GET", f"/projects/{encoded}/issues/{iid}/notes")
         return result
+
+    def update_issue_note(
+        self,
+        project: str,
+        iid: int,
+        note_id: int,
+        body: str,
+    ) -> dict[str, Any]:
+        """Replace the body of an issue note."""
+        self._require_write()
+        text = self._require_body(body)
+        self._require_note_id(note_id)
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+        payload = self._request(
+            "PUT",
+            f"/projects/{encoded}/issues/{iid}/notes/{note_id}",
+            json_body={"body": text},
+        )
+        return self._format_note(payload)
+
+    def delete_issue_note(self, project: str, iid: int, note_id: int) -> dict[str, Any]:
+        """Permanently delete an issue note."""
+        self._require_write()
+        self._require_note_id(note_id)
+        project_value = self._resolve_project_value(project)
+        encoded = self._encode_project(project_value)
+        self._request("DELETE", f"/projects/{encoded}/issues/{iid}/notes/{note_id}")
+        return {
+            "deleted": True,
+            "project": project_value,
+            "issue_iid": iid,
+            "note_id": note_id,
+        }
 
     def _resolve_user_ids(self, usernames: str) -> list[int]:
         """Map comma-separated usernames to GitLab numeric ids.

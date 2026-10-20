@@ -110,6 +110,23 @@ covered** — just leave it out.
 ## Step 4 - compose
 
 - Follow the previous mail's structure exactly (step 1).
+- Format the body as a consistently indented plain-text outline. Put section
+  headings at the left margin, indent subheadings by four spaces, and indent
+  their items by eight spaces. Items directly under a section use four spaces.
+  Use spaces, not tabs, and leave a blank line between sections rather than
+  between sibling items. Normalize older inconsistent spacing to this style.
+- For example:
+
+  ```text
+  * BMC
+      o SWQA
+          * Updated the API unit-test module.
+      o Tavor SVB
+          * Reviewed the flash programming tool MR.
+  * Infrastructure
+      * Updated the station setup guide.
+  ```
+
 - Group by work area, using the `modules` grouping from the git script.
 - Write outcomes, not activity: "closed the I3C timing gap" beats "pushed 6
   commits".

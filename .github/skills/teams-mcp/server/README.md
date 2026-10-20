@@ -6,7 +6,7 @@ one tool surface: Microsoft Graph (delegated) and a Power Automate file drop.
 ## Install
 
 ```powershell
-cd C:\ec_accurev_git\.github\skills\teams-mcp\server
+cd C:\CCSystem\.github\skills\teams-mcp\server
 pip install -e ".[test]"          # filedrop backend
 pip install -e ".[graph,test]"    # adds msal for the graph backend
 ```
@@ -105,7 +105,23 @@ Teams connector is a *standard* connector needing no app registration or admin
 consent, but its HTTP trigger is premium-only - hence files.
 
 **Inbound flow:** trigger *"When a new chat message is added"* → create a file in
-`TEAMS_INBOX_DIR`, one JSON object per message:
+a synced work OneDrive folder, one JSON object per message. The trigger emits a notification
+array, not the message text. Inside an **Apply to each** over
+`triggerBody()?['value']`, add Teams **Get message details** (message type
+**Group chat**, message `item()?['messageId']`, group chat
+`item()?['conversationId']`). Rename that action `Fetch_chat_message`, then
+use OneDrive for Business **Create file** inside the loop:
+
+- Folder: `/teams-mcp/inbox` in a work OneDrive that is synced to this PC
+- File name (expression): `concat(guid(), '.json')`
+- File content (expression):
+  `string(setProperty(body('Fetch_chat_message'), 'chatId', item()?['conversationId']))`
+
+Set `TEAMS_INBOX_DIR` to the synced **local** `teams-mcp\inbox` folder, not
+the OneDrive web path. Notification-only files from older flow versions contain
+no sender or text and are ignored. The filedrop backend accepts both the
+fetched Teams message details (nested `from.user` and `body.content`) and
+the simpler format below:
 
 ```json
 {
@@ -124,9 +140,14 @@ Key spellings are flexible - `messageId`/`conversationId`/`sender`/`content`/
 `displayName`. HTML bodies are flattened to plain text.
 
 **Outbound flow:** trigger *"When a file is created"* on `TEAMS_OUTBOX_DIR` →
-action *"Post message in a chat or channel"* using `chatId` and `body` from the
-file. Replies are written via a temp file and `os.replace`, so the flow can never
-observe a half-written file and post a truncated message.
+**Parse JSON** with file content `base64ToString(triggerBody()?['$content'])`
+and required string fields `chatId` and `body` → Teams *"Post message in a chat
+or channel"* with **Post as: User**, **Post in: Group chat**, Group chat set to
+the parsed `chatId` (custom value), and Message set to the parsed `body`.
+Choose the work OneDrive `/teams-mcp/outbox` folder in the trigger's folder
+picker and set `TEAMS_OUTBOX_DIR` to its synced local path. Replies are staged
+outside the watched folder and atomically moved into it, so the flow cannot
+trigger on a temporary file that disappears during the rename.
 
 Prerequisite: a synced work folder. OneDrive **for Business** or a SharePoint
 library - the consumer OneDrive is not reachable by the standard connectors.
@@ -203,11 +224,11 @@ Revisit only if admin consent is refused outright *and* read-only triage is enou
 ## Tests
 
 ```powershell
-cd C:\ec_accurev_git\.github\skills\teams-mcp\server
+cd C:\CCSystem\.github\skills\teams-mcp\server
 python -m pytest -q
 ```
 
-34 tests, no network and no Teams access required: the Graph backend runs against
+Tests require no network or Teams access: the Graph backend runs against
 a fake HTTP client and `filedrop` against a temp directory.
 
 ## Troubleshooting

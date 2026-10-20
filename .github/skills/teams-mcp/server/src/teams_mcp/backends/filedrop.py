@@ -80,18 +80,26 @@ class FileDropBackend:
             if isinstance(payload, list):
                 messages.extend(self._parse(item, path) for item in payload if isinstance(item, dict))
             elif isinstance(payload, dict):
+                if isinstance(payload.get("value"), list) and any(
+                    isinstance(item, dict) and "subscriptionId" in item
+                    for item in payload["value"]
+                ):
+                    continue
                 messages.append(self._parse(payload, path))
         messages.sort(key=lambda item: item.sort_key())
         return messages
 
     def _parse(self, payload: dict[str, Any], path: Path) -> Message:
         raw_body = _first(payload, _BODY_KEYS)
+        sender = payload.get("from")
+        user = sender.get("user") if isinstance(sender, dict) else None
+        user = user if isinstance(user, dict) else {}
         return Message(
             id=_first(payload, _ID_KEYS) or path.stem,
             chat_id=_first(payload, _CHAT_KEYS),
             chat_name=_first(payload, _CHAT_NAME_KEYS),
-            sender=_first(payload, _SENDER_KEYS),
-            sender_email=_first(payload, _EMAIL_KEYS),
+            sender=_first(user, ("displayName",)) or _first(payload, _SENDER_KEYS),
+            sender_email=_first(user, ("userPrincipalName", "email")) or _first(payload, _EMAIL_KEYS),
             created_at=_first(payload, _TIME_KEYS),
             body=strip_html(raw_body),
             web_url=_first(payload, _URL_KEYS),
@@ -148,12 +156,14 @@ class FileDropBackend:
             "queuedAt": datetime.now(timezone.utc).isoformat(),
             "replyId": reply_id,
         }
-        handle, tmp_name = tempfile.mkstemp(dir=str(outbox), prefix=".reply-", suffix=".tmp")
+        staging_dir = self.config.state_file.parent
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        handle, tmp_name = tempfile.mkstemp(dir=str(staging_dir), prefix=".reply-", suffix=".tmp")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as tmp:
                 json.dump(payload, tmp, indent=2)
-            # Rename into place so the sync agent and the flow never observe a
-            # partially written file and post a truncated message.
+            # Keep the temporary file outside the watched folder so the flow
+            # cannot trigger on a file that disappears during the rename.
             os.replace(tmp_name, target)
         except BaseException:
             Path(tmp_name).unlink(missing_ok=True)

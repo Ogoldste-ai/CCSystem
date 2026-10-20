@@ -185,6 +185,52 @@ def test_filedrop_accepts_alternate_key_spellings(tmp_path):
     assert messages[0].sender == "Bar Issacha"
 
 
+def test_filedrop_parses_teams_get_message_details_output(tmp_path):
+    config = make_config(tmp_path)
+    drop(
+        config.inbox_dir,
+        "message.json",
+        {
+            "id": "123",
+            "chatId": "19:chat@thread.v2",
+            "createdDateTime": "2026-10-20T12:06:09.089Z",
+            "from": {
+                "user": {
+                    "displayName": "Example Sender",
+                    "userPrincipalName": "sender@example.test",
+                }
+            },
+            "body": {
+                "contentType": "html",
+                "content": "<p>Hello &amp; welcome</p>",
+                "plainTextContent": "Hello & welcome",
+            },
+            "webUrl": "https://teams.microsoft.com/l/message/example",
+        },
+    )
+    backend = FileDropBackend(config)
+    messages = backend.fetch_messages("19:chat@thread.v2")
+    assert len(messages) == 1
+    assert messages[0].id == "123"
+    assert messages[0].body == "Hello & welcome"
+    assert messages[0].sender == "Example Sender"
+    assert messages[0].sender_email == "sender@example.test"
+    assert messages[0].created_at == "2026-10-20T12:06:09.089Z"
+    assert messages[0].web_url == "https://teams.microsoft.com/l/message/example"
+    assert backend.list_chats()[0].members == ["Example Sender"]
+
+
+def test_filedrop_ignores_notification_only_files(tmp_path):
+    config = make_config(tmp_path)
+    drop(
+        config.inbox_dir,
+        "notification.json",
+        {"value": [{"subscriptionId": "subscription", "messageId": "123"}]},
+    )
+    drop(config.inbox_dir, "message.json", {"id": "123", "chatId": "chat", "body": "hello"})
+    assert [message.body for message in FileDropBackend(config).fetch_recent()] == ["hello"]
+
+
 def test_filedrop_skips_malformed_files(tmp_path):
     """A file caught mid-sync must not break the whole listing."""
     config = make_config(tmp_path)
@@ -223,14 +269,27 @@ def test_filedrop_list_chats_groups_and_orders(tmp_path):
     assert [chat.id for chat in FileDropBackend(config).list_chats()] == ["new", "old"]
 
 
-def test_filedrop_reply_writes_json_and_leaves_no_temp(tmp_path):
+def test_filedrop_reply_writes_json_and_leaves_no_temp(tmp_path, monkeypatch):
     config = make_config(tmp_path, allow_write=True)
+    import teams_mcp.backends.filedrop as filedrop
+
+    replace = filedrop.os.replace
+    staged_paths = []
+
+    def record_replace(source, target):
+        staged_paths.append(Path(source))
+        replace(source, target)
+
+    monkeypatch.setattr(filedrop.os, "replace", record_replace)
     result = FileDropBackend(config).send_reply("chat-a", "on it")
     written = list(config.outbox_dir.glob("reply-*.json"))
     assert result["queued"] is True and len(written) == 1
     payload = json.loads(written[0].read_text(encoding="utf-8"))
     assert payload["chatId"] == "chat-a" and payload["body"] == "on it"
+    assert len(staged_paths) == 1
+    assert staged_paths[0].parent == config.state_file.parent
     assert list(config.outbox_dir.glob("*.tmp")) == []
+    assert list(config.state_file.parent.glob(".reply-*.tmp")) == []
 
 
 def test_filedrop_health_counts_messages(tmp_path):

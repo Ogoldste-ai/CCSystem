@@ -27,9 +27,14 @@ search_messages(query="Weekly - WW", folder="Sent Items", days=30, limit=10)
 ```
 
 Take the **most recent** hit. Keep its `entry_id` — it is the reply target.
-Call `get_message(entry_id)` to read the body: that body is the **format
-template** for the new mail. Match its section headings, ordering, tone and
-length. Do not impose a different layout.
+Call `get_message(entry_id)` to read the body for relevant work areas, tone
+and length. Use the formatting in step 4, even if the previous weekly uses
+the older three-level plain-text outline.
+
+The approved format reference is the sent mail to Ben titled
+`MonthReview - WW38, WW39, WW40, WW43 - Booter` (October 20, 2026).
+It supplies the layout and status colors only: do not use it as the weekly
+reply target, copy its reporting period, or change the weekly recipients.
 
 If nothing is found, widen to `days=90`. If still nothing, stop and ask the
 user for the subject of the last weekly rather than guessing a WW number.
@@ -109,22 +114,44 @@ covered** — just leave it out.
 
 ## Step 4 - compose
 
-- Follow the previous mail's structure exactly (step 1).
-- Format the body as a consistently indented plain-text outline. Put section
-  headings at the left margin, indent subheadings by four spaces, and indent
-  their items by eight spaces. Items directly under a section use four spaces.
-  Use spaces, not tabs, and leave a blank line between sections rather than
-  between sibling items. Normalize older inconsistent spacing to this style.
-- For example:
+- Use the approved mail to Ben's **two-level bulleted layout**, not the older
+  section/subheading/item outline. Start with a greeting appropriate to the
+  weekly recipients (`Hi all,` for the distribution, not `Hi Ben,`), then a
+  reporting-period line such as `Weekly - WW<n> (<start date>-<end date>)`.
+  Include a vacation/absence line only when supported by the gathered sources
+  or supplied by the user; bold the dates and reason as in the reference.
+- Use filled-disc bullets for work-area headings and nested hollow-circle
+  bullets for their items. The reference orders the areas as `BMC and Tavor
+  SVB`, `Validation infrastructure`, `I3C`, then `Booter`. Keep relevant areas
+  in that order, omit empty ones, and add other evidenced work areas as needed.
+  Fold subareas such as SWQA into the item wording rather than a third level.
+- End each item with an evidence-backed status, coloring **only the suffix**:
+  `- done` in green (`#4EA72E`) for completed work, `- to-do` in red
+  (`#FF0000`) for pending work, and `- still going` in amber (`#FFC000`)
+  for ongoing or blocked work. State the blocker in the item itself. A
+  completed review can be `done` without implying the MR was merged.
+  If status is unclear, ask the user rather than inventing one.
+- Keep sibling items compact, with visual separation between work areas.
+  Keep each outcome in one bullet; do not reproduce accidental split
+  sentences or unfinished text from the reference. Close with `Regards,`
+  and `Oren Goldstein` on separate lines.
+- Show a plain-text preview in chat, using four spaces for nested items
+  and retaining the status words. For example (illustrative, not work to copy):
 
   ```text
-  * BMC
-      o SWQA
-          * Updated the API unit-test module.
-      o Tavor SVB
-          * Reviewed the flash programming tool MR.
-  * Infrastructure
-      * Updated the station setup guide.
+  Hi all,
+
+  Weekly - WW<n> (<start date>-<end date>)
+
+  * BMC and Tavor SVB
+      o Updated the API unit-test module. - done
+      o Flash programming tool review is pending. - to-do
+
+  * I3C
+      o Shared-module work is blocked on review. - still going
+
+  Regards,
+  Oren Goldstein
   ```
 
 - Group by work area, using the `modules` grouping from the git script.
@@ -133,7 +160,7 @@ covered** — just leave it out.
 - Merge duplicates: one design review may appear as a meeting, an MR and
   three commits. Report it once.
 - Keep it to the length of previous weeks' mails.
-- Flag blockers and next steps if the previous mails have such a section.
+- Include blockers and next steps in the relevant work-area items.
 
 Show the complete body to the user and incorporate any corrections.
 
@@ -151,6 +178,41 @@ reply_to_message(
 
 The `subject` argument is required — without it Outlook forces
 `RE: Weekly - WW<n>` and the week number never advances.
+
+### Apply the HTML formatting
+
+The current `reply_to_message` tool assigns plain-text `Body`; it does not
+accept HTML. Do not pass HTML tags in `body` or claim that the plain-text
+draft has the reference's bullets and colors.
+
+After creating the draft, use local Outlook COM to format **that saved
+draft**, identified by the returned `entry_id`:
+
+1. Read its `Body`. Normalize CRLF/LF in both it and the composed plain-text
+   body, and verify that it starts with the exact composed body. If it does
+   not, stop and report the mismatch without changing the draft.
+2. Remove that prefix only, retaining the remaining quoted reply text.
+   HTML-encode all mail text, including the quoted text, before inserting
+   it into markup.
+3. Build the new content as HTML paragraphs and nested `<ul>`/`<li>` lists.
+   Set the outer list's `list-style-type:disc` and the inner lists'
+   `list-style-type:circle`, using inline styles. Add each status suffix
+   in a `<span style="color:<status color>">`. Keep normal text in the
+   default color and use `<strong>` for any evidenced absence dates/reason.
+4. Append the retained, encoded reply text after a separator, preserving its
+   line breaks with `<br>`. Set the draft's `BodyFormat` to `2` (HTML),
+   assign the complete HTML document to `HTMLBody`, and call `Save()`.
+   Do not append the old `HTMLBody` wholesale: it already includes the new
+   plain-text content and would duplicate the report. Do not change the
+   subject, recipients or reply target, create a second draft, or call `Send()`.
+5. Reopen the saved item by its `entry_id` and verify that it is unsent,
+   retains the expected subject and recipients, and has HTML lists and the
+   applicable status colors. Check that the new report appears once and the
+   quoted reply text remains below it.
+
+If COM formatting is unavailable or fails, explicitly report that the saved
+draft is plain text or that formatting is incomplete; do not claim a visual
+match. This formatting step never sends mail.
 
 ## Step 6 - report back
 

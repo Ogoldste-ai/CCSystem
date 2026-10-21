@@ -1,3 +1,8 @@
+---
+name: outlook-mcp
+description: Read, search, draft and send Outlook mail and view calendar events through a local MCP server that drives the classic Outlook desktop client over COM. Use when you need to access the user's mailbox or calendar.
+---
+
 # Outlook MCP Skill
 
 This repository ships a local Outlook MCP server under

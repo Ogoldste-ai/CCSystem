@@ -1,3 +1,8 @@
+---
+name: teams-mcp
+description: Triage Microsoft Teams chats through a local MCP server - read messages sent to the user, detect new ones, and draft replies. Use when asked to check, summarize or reply to Teams messages.
+---
+
 # Teams MCP Skill
 
 A local MCP server for triaging Microsoft Teams chats: read messages sent to

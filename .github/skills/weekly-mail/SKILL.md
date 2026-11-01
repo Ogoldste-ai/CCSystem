@@ -133,8 +133,8 @@ covered** — just leave it out.
   If status is unclear, ask the user rather than inventing one.
 - Keep sibling items compact, with visual separation between work areas.
   Keep each outcome in one bullet; do not reproduce accidental split
-  sentences or unfinished text from the reference. Close with `Regards,`
-  and `Oren Goldstein` on separate lines.
+  sentences or unfinished text from the reference. Close with the user's
+  Outlook **reply signature**, following the signature instructions below.
 - Show a plain-text preview in chat, using four spaces for nested items
   and retaining the status words. For example (illustrative, not work to copy):
 
@@ -164,7 +164,57 @@ covered** — just leave it out.
 
 Show the complete body to the user and incorporate any corrections.
 
+### Outlook reply signature
+
+Weekly mails are replies, so use the reply signature, not the longer
+new-message signature. The user's reply template is `Oren_Replay_message`;
+the new-message template is `Oren_New_message`. Outlook may append an account
+suffix to their filenames.
+
+Read the matching `.htm` and `.txt` files under
+`%APPDATA%\Microsoft\Signatures` using file tools. Resolve the reply template
+for the sending account; if the match is missing or ambiguous, ask rather than
+substituting the new-message signature or inventing one.
+
+Use the `.txt` content as the closing in the plain-text preview. For HTML,
+insert the signature's actual `<body>` contents after the report and before
+the quoted thread, retaining its formatting and required styles. The current
+reply signature is the short blue `Regards,` / `Oren Goldstein` closing
+(`#1F497D`), with no images. Read the file each run rather than hard-coding
+that appearance, so Outlook signature edits are respected.
+
+Preserve the signature's paragraph spacing as well as its text and color.
+Read its `<head>` styles, including `p.MsoNormal`, and inline the applicable
+rules on the signature paragraphs before inserting the body fragment.
+Copying only `<body>` drops those rules and Outlook can introduce automatic
+paragraph margins. For the current compact reply signature, set each closing
+paragraph to `margin:0; mso-margin-top-alt:0; mso-margin-bottom-alt:0;
+line-height:normal` (single spacing). Keep these overrides scoped to the
+signature, not global `MsoNormal` rules that would change the report or history.
+
+Include the signature **once** in the new report: it replaces the typed
+closing, not an extra block after it. Leave signatures in quoted history
+unchanged. Outlook may insert its own `_MailAutoSig` block when an editor is
+initialized; check for it before adding a signature and retain only one
+closing in the new report. Do not copy a whole HTML document into the fragment
+or encode the signature's markup as plain text. If a changed signature introduces images,
+preserve them as embedded mail assets; if the available tools cannot do that,
+report the limitation instead of inserting broken local-file links.
+
 ## Step 5 - create the draft
+
+Build an HTML fragment from the composed body before calling Outlook. Use
+paragraphs and nested `<ul>`/`<li>` lists, with inline `list-style-type:disc`
+for work areas and `list-style-type:circle` for their items. Color only each
+status suffix with a `<span style="color:...">` using the step 4 colors.
+HTML-encode all mail-derived text before adding markup. Use `<strong>` for
+any evidenced absence dates/reason. Append the actual Outlook reply-signature
+fragment in place of the plain-text preview's closing.
+
+Discover the Outlook tool schema first and confirm `reply_to_message` accepts
+`html_body`. If it does not, stop before creating a draft and report that the
+Outlook MCP server needs reloading after its local update. Do not silently
+create a plain-text draft or fall back to a shell formatting step.
 
 ```
 reply_to_message(
@@ -173,46 +223,29 @@ reply_to_message(
     reply_all=True,
     send=False,
     subject="Weekly - WW<n+1><same suffix style as before>",
+    html_body="<HTML fragment of the composed body>",
 )
 ```
 
 The `subject` argument is required — without it Outlook forces
 `RE: Weekly - WW<n>` and the week number never advances.
 
-### Apply the HTML formatting
+The tool sets Outlook's HTML body and saves the formatted reply in the same
+call. It appends the encoded quoted original below a separator, preserving
+line breaks without duplicating the report. No separate PowerShell/COM
+permission prompt is needed for formatting; normal MCP tool permissions
+still apply, and sending remains forbidden.
 
-The current `reply_to_message` tool assigns plain-text `Body`; it does not
-accept HTML. Do not pass HTML tags in `body` or claim that the plain-text
-draft has the reference's bullets and colors.
-
-After creating the draft, use local Outlook COM to format **that saved
-draft**, identified by the returned `entry_id`:
-
-1. Read its `Body`. Normalize CRLF/LF in both it and the composed plain-text
-   body, and verify that it starts with the exact composed body. If it does
-   not, stop and report the mismatch without changing the draft.
-2. Remove that prefix only, retaining the remaining quoted reply text.
-   HTML-encode all mail text, including the quoted text, before inserting
-   it into markup.
-3. Build the new content as HTML paragraphs and nested `<ul>`/`<li>` lists.
-   Set the outer list's `list-style-type:disc` and the inner lists'
-   `list-style-type:circle`, using inline styles. Add each status suffix
-   in a `<span style="color:<status color>">`. Keep normal text in the
-   default color and use `<strong>` for any evidenced absence dates/reason.
-4. Append the retained, encoded reply text after a separator, preserving its
-   line breaks with `<br>`. Set the draft's `BodyFormat` to `2` (HTML),
-   assign the complete HTML document to `HTMLBody`, and call `Save()`.
-   Do not append the old `HTMLBody` wholesale: it already includes the new
-   plain-text content and would duplicate the report. Do not change the
-   subject, recipients or reply target, create a second draft, or call `Send()`.
-5. Reopen the saved item by its `entry_id` and verify that it is unsent,
-   retains the expected subject and recipients, and has HTML lists and the
-   applicable status colors. Check that the new report appears once and the
-   quoted reply text remains below it.
-
-If COM formatting is unavailable or fails, explicitly report that the saved
-draft is plain text or that formatting is incomplete; do not claim a visual
-match. This formatting step never sends mail.
+Confirm the result has `saved=True`, `sent=False`, the expected subject and
+`body_format="html"`. Read back the saved `entry_id` with
+`get_message(include_quoted=True)` to check recipients, report wording, and
+retained quoted history (page through it if truncated). If formatting failed,
+report the draft as incomplete rather than claiming success. Confirm the
+new report has exactly one reply signature; do not count signatures in the
+quoted thread as duplicates. Plain-text readback cannot prove visual spacing.
+If inspecting the rendered draft is available, check that the closing has
+0 pt before/after and single line spacing for the current template; otherwise
+state that rendering was not verified rather than claiming a visual match.
 
 ## Step 6 - report back
 

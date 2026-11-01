@@ -4,6 +4,7 @@ import os
 import re
 import threading
 from datetime import datetime, timedelta
+from html import escape
 from typing import Any, Iterable, Iterator
 
 from .config import OutlookConfig, OutlookUnavailableError
@@ -1034,13 +1035,24 @@ class OutlookClient:
         reply_all: bool = False,
         send: bool = False,
         subject: str = "",
+        html_body: str = "",
     ) -> dict[str, Any]:
         item = _safe(lambda: self.namespace.GetItemFromID(entry_id))
         if item is None:
             raise OutlookUnavailableError(f"No mail item with entry_id {entry_id!r}.")
         draft = item.ReplyAll() if reply_all else item.Reply()
         # Prepend so Outlook's quoted original stays underneath, as in a normal reply.
-        draft.Body = body + "\n\n" + str(_safe(lambda: draft.Body, "") or "")
+        quoted = str(_safe(lambda: draft.Body, "") or "")
+        if html_body.strip():
+            quoted_html = escape(quoted.replace("\r\n", "\n").replace("\r", "\n")).replace(
+                "\n", "<br>"
+            )
+            draft.BodyFormat = 2
+            draft.HTMLBody = (
+                "<html><body>" + html_body + "<hr>" + quoted_html + "</body></html>"
+            )
+        else:
+            draft.Body = body + "\n\n" + quoted
         # Outlook forces "RE: <original>", which is wrong for a rolling series
         # like a weekly report where the subject carries a changing week number.
         if subject.strip():
@@ -1060,5 +1072,6 @@ class OutlookClient:
             "reply_all": reply_all,
             "entry_id": str(_safe(lambda: draft.EntryID, "") or ""),
             "subject": str(_safe(lambda: draft.Subject, "") or ""),
+            "body_format": "html" if _safe(lambda: draft.BodyFormat) == 2 else "plain",
             "where": "Outlook Drafts folder - open Outlook to review and send.",
         }

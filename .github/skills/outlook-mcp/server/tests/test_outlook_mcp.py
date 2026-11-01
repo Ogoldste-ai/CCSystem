@@ -1216,6 +1216,39 @@ def test_reply_draft_allowed_but_sending_blocked_without_the_flag():
         tools["reply_to_message"]("id-1", "text", send=True)
 
 
+def test_html_reply_saves_formatted_content_once_and_escapes_quoted_text():
+    client, config, _ = build_client(allow_write=False)
+    original = client.namespace.GetItemFromID("id-1")
+    result = tools_of(build_server(config, client))["reply_to_message"](
+        "id-1",
+        "Weekly report",
+        reply_all=True,
+        subject="Weekly - WW44",
+        html_body='<p>Weekly report</p><ul><li><span style="color:#4EA72E">done</span></li></ul>',
+    )
+    draft = original.last_reply
+    assert result["sent"] is False
+    assert result["body_format"] == "html"
+    assert draft.saved and not draft.sent
+    assert draft.replied_all is True
+    assert draft.Subject == "Weekly - WW44"
+    assert draft.BodyFormat == 2
+    assert draft.HTMLBody.count("Weekly report") == 1
+    assert '<span style="color:#4EA72E">done</span>' in draft.HTMLBody
+    assert "&gt; original text" in draft.HTMLBody
+    assert draft.HTMLBody.index("Weekly report") < draft.HTMLBody.index("&gt; original text")
+
+
+def test_html_reply_cannot_bypass_send_permission():
+    client, config, _ = build_client(allow_write=False)
+    original = client.namespace.GetItemFromID("id-1")
+    with pytest.raises(OutlookWriteDisabledError):
+        tools_of(build_server(config, client))["reply_to_message"](
+            "id-1", "text", send=True, html_body="<p>text</p>"
+        )
+    assert not hasattr(original, "last_reply")
+
+
 def test_mark_read_is_gated():
     client, config, _ = build_client(allow_write=False)
     with pytest.raises(OutlookWriteDisabledError):

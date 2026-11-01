@@ -76,10 +76,16 @@ Write:
 
 - `create_draft(to, subject, body, cc="", bcc="")` - **ungated**; a draft goes
   nowhere until you click Send in Outlook
-- `reply_to_message(entry_id, body, reply_all=False, send=False, subject="")` - drafts by
+- `reply_to_message(entry_id, body, reply_all=False, send=False, subject="", html_body="")` - drafts by
   default; `send=True` needs `OUTLOOK_ALLOW_WRITE`. `subject` overrides
   Outlook's automatic `RE: <original>`, which a rolling series such as a
   weekly report needs in order to advance its week number.
+  Supply `html_body` as an HTML fragment to save formatted reply content in the
+  same call, without a separate shell/COM formatting step. Keep `body` as the
+  plain-text preview; it is not also inserted when HTML is supplied. Encode
+  mail-derived text before adding markup. The quoted original is escaped and
+  retained below a separator (its original visual formatting is not retained).
+  The draft result reports `body_format`. Sending permissions are unchanged.
 - `send_mail(to, subject, body, cc="", bcc="")` - needs `OUTLOOK_ALLOW_WRITE`
 - `mark_read(entry_id, read=True)` - needs `OUTLOOK_ALLOW_WRITE`
 - `save_attachments(entry_id, dest_dir="", names=[], include_inline=False, overwrite=False)`

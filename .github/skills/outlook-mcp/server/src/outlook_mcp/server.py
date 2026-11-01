@@ -357,6 +357,7 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
         reply_all: bool = False,
         send: bool = False,
         subject: str = "",
+        html_body: str = "",
     ) -> dict[str, Any]:
         """Reply to a message, saving a draft by default.
 
@@ -367,6 +368,12 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
         `subject` overrides Outlook's automatic "RE: <original>". Leave it empty
         for a normal reply; set it for a rolling series whose subject changes
         each time, such as a weekly report with a week number in it.
+
+        `html_body` is an optional HTML fragment for the new reply content.
+        When supplied it replaces the plain-text `body` in the saved reply;
+        Outlook's quoted original is HTML-escaped and retained underneath.
+        Encode all mail-derived text before adding markup. No separate shell
+        or COM formatting step is needed. Sending permissions are unchanged.
         """
         if not entry_id.strip():
             raise ValueError("entry_id is required.")
@@ -380,6 +387,7 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
             reply_all=reply_all,
             send=send,
             subject=subject,
+            html_body=html_body,
         )
 
     return server

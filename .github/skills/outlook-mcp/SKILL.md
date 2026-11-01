@@ -60,7 +60,7 @@ Read:
 Write:
 
 - `create_draft(to, subject, body, cc="", bcc="")` - **ungated**, always safe
-- `reply_to_message(entry_id, body, reply_all=False, send=False, subject="")`
+- `reply_to_message(entry_id, body, reply_all=False, send=False, subject="", html_body="")`
 - `send_mail(to, subject, body, cc="", bcc="")` - requires `OUTLOOK_ALLOW_WRITE`
 - `mark_read(entry_id, read=True)` - requires `OUTLOOK_ALLOW_WRITE`
 - `save_attachments(entry_id, dest_dir="", names=[], include_inline=False, overwrite=False)`
@@ -121,6 +121,29 @@ Pass `names=[...]` to pick specific attachments by filename or 1-based index.
 - Replying to a rolling series (a weekly report, a numbered status thread)
   needs the `subject` argument: Outlook otherwise forces `RE: <original>`, so
   the number in the subject never advances.
+- For formatted replies, pass an HTML fragment in `html_body` and the matching
+  plain-text preview in `body`. The tool saves the HTML directly and appends the
+  HTML-escaped quoted original, without duplicating the plain-text preview.
+  Encode all mail-derived text before inserting it into HTML. This needs no
+  separate shell formatting step; sending permissions are unchanged.
+- **Outlook signatures:** use the reply signature for replies and the
+  new-message signature for new mail. The user's templates are
+  `Oren_Replay_message` and `Oren_New_message`, respectively, under
+  `%APPDATA%\Microsoft\Signatures` (filenames may include an account suffix).
+  Resolve the template for the sending account; ask if missing or ambiguous.
+  For HTML replies, read the actual `.htm` signature and include its body
+  fragment and required styles once in `html_body`, replacing any typed
+  closing; use its `.txt` counterpart for the plain-text preview. Do not
+  assume the tool automatically inserts an Outlook signature. Preserve
+  embedded assets; if a tool cannot embed a signature's images, report that
+  limitation rather than using broken file links or silently dropping a logo.
+  Inline the signature's applicable paragraph styles from its HTML `<head>`;
+  copying its body alone loses `MsoNormal` spacing. The current reply closing
+  uses zero paragraph margins and single spacing: scope
+  `margin:0; mso-margin-top-alt:0; mso-margin-bottom-alt:0; line-height:normal`
+  to its paragraphs, keeping its font and color. Check for an Outlook-inserted
+  `_MailAutoSig` block so the new content has only one closing. Plain-text
+  readback does not verify rendered spacing.
 - `list_calendar_events` expands recurring meetings into occurrences. Use
   `busy_only=True` to drop free blocks, which is how cancelled meetings and
   self-booked focus time report. **Tentative is deliberately kept** - an

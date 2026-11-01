@@ -59,6 +59,20 @@ readiness probe in this pane for `tv_owner`, `tv_ready`, `$ROOT_DIR`, `$cwd`
 and accessible allowlisted tools. Require its saved source readiness nonce
 and expected paths; a JSON `completed` flag alone is insufficient. A busy or
 ambiguous pane receives **no input**. Failure invalidates launch readiness.
+Apply `AGENTS.md`'s read-only-client and foreground-interpreter gates: retain
+tmux's pane PID, verify the actual original CSH PID/executable/start identity
+separately, and allow only positively verified read-only observers. Recheck
+clients around snapshots and immediately before literal input and Enter.
+
+Source readiness may come from strict `marked_source` verification or
+context-approved `approved_live_revalidation`. The latter retains unknown
+historical source exit status and requires its saved approval/context; it
+never weakens these fresh resume checks. Existing approved
+`session_only_live_revalidation` provenance may be resumed on its original
+context after the same live checks. Older envelopes without basis fields
+follow the existing resume checks; do not fabricate status or migrate them.
+Missing/unapproved readiness invokes source's recovery decision only after
+the retained-attempt safety gate; never silently reduce source expectations.
 
 Show remote commands before execution. Use the connection skill's verified
 alias/options and separate stdout/stderr/exit status. Wrap controller scripts
@@ -271,16 +285,21 @@ and SSH failure. A prompt-like line is not enough. The sample below rejects
 uncertain evidence conservatively; its `foreground` is a verified executable
 basename, not a label inferred from the text. Do not normalize brackets or
 strip quote characters to force a match.
+If foreground evidence requires a separate process query, bracket that query
+with identity-stable read-only snapshots and require unchanged prompt/cursor/
+tail and foreground group. Reject a changed snapshot; do not combine old
+screen text with a newer simulator process.
 
 ```python
 def current_prompt(s, identity, nonce):
     if not s["live"] or s["identity"] != identity or s["foreground"] not in ("vsim", "vsimk"):
         return None
     boundary = "__TV_RUN_BEGIN_" + nonce + "__"
-    lines = [line.rstrip(" \t") for line in s["history"].splitlines()]
+    raw_lines = s["history"].splitlines()
+    lines = [line.rstrip(" \t") for line in raw_lines]
     if lines.count(boundary) != 1:
         return None
-    fresh = lines[lines.index(boundary) + 1:]
+    fresh = raw_lines[lines.index(boundary) + 1:]
     while fresh and not fresh[-1].strip(" \t"):
         fresh.pop()
     rows = s["screen"].splitlines()
@@ -288,10 +307,10 @@ def current_prompt(s, identity, nonce):
     if not fresh or not 0 <= y < len(rows):
         return None
     row = rows[y].rstrip(" \t")
-    if row != fresh[-1] or any(r.strip(" \t") for r in rows[y + 1:]):
+    if row != fresh[-1].rstrip(" \t") or any(r.strip(" \t") for r in rows[y + 1:]):
         return None
     match = re.fullmatch(r"[ \t]*VSIM[ \t]+([0-9]+)[ \t]*>[ \t]*", row)
-    if not match or s["cursor_x"] < len(row) or s["cursor_x"] > len(rows[y]):
+    if not match or s["cursor_x"] < len(row) or s["cursor_x"] > len(fresh[-1]):
         return None
     return {"text": row, "number": match[1], "cursor": (y, s["cursor_x"])}
 
@@ -411,6 +430,27 @@ Report selected straps/command, host/build/emulation, exact pane identity,
 CLI-ready observation or honest failure/uncertainty, and checkpoint path.
 At readiness **send nothing else**, not even Enter or a CSH verification probe.
 
+### Required terminal handoff
+
+At the end of every **CLI-ready** run report, including an already-ready
+read-only resume, automatically print the exact copy/paste-ready attach
+command in a PowerShell code block. Do not wait for the user to ask or offer
+to provide it later. Construct it from the validated saved alias, socket and
+session actually used, not examples, stale context or these placeholders:
+
+```powershell
+ssh -t <verified-alias> "tmux -L <verified-socket> attach -r -t <verified-session>"
+```
+
+Substitute the real validated values before displaying it. The group creates
+the socket and session with the same generated name; retained source/run
+identity determines the target, never another session with a familiar name.
+Say **read-only** and include: detach without stopping emulation by pressing
+**Ctrl+B**, releasing, then **D**. If the original session is gone/replaced,
+report that honestly, not a working attach command copied from history.
+Printing the command is not permission for the assistant to attach, send
+input, or change tmux settings. CLI ready remains distinct from boot complete.
+
 ## Manual workflow
 
 These are **remote POSIX controller-shell recipes**, executed through bounded
@@ -421,17 +461,21 @@ dispatch gates (session ID, creation time, pane ID, shell PID, current CSH
 command and path), not the expanded inspection record; `idle` is the source
 owner prompt without its trailing space. Fresh source checks must already
 have passed.
+Define the common `check_clients` function from `AGENTS.md` before these
+recipes, and apply its foreground-interpreter/empty-input checks as well.
 
 ### Inspect without sending
 
 ```sh
 set -eu
+check_clients
 printf '__TV_SNAPSHOT_%s_META_BEFORE__\n' "$nonce"
 tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_dead}|#{cursor_x}|#{cursor_y}'
 printf '__TV_SNAPSHOT_%s_HISTORY__\n' "$nonce"
 tmux -L "$name" capture-pane -p -J -S - -t "$pane"
 printf '__TV_SNAPSHOT_%s_SCREEN__\n' "$nonce"
 tmux -L "$name" capture-pane -p -t "$pane"
+check_clients
 printf '__TV_SNAPSHOT_%s_META_AFTER__\n' "$nonce"
 tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_dead}|#{cursor_x}|#{cursor_y}'
 printf '__TV_SNAPSHOT_%s_END__\n' "$nonce"
@@ -446,18 +490,28 @@ markers inside captured text as valid duplicates.
 tmux 2.7 right-pads captures; strip only horizontal right padding when matching
 markers. Require matching metadata before/after; never use an old cursor
 position against a newer screen. Refuse wrapped/truncated prompt ambiguity.
+Use the untrimmed joined history tail to bound a prompt's cursor: an unjoined
+screen can omit the legitimate trailing prompt space. Preserve that raw tail
+while trimming only for line comparison, as `current_prompt` does above.
 No `attach`, process replacement, interrupt, restart, or new server is used.
 
 ### Stage the fresh boundary in an already verified idle CSH
 
 ```sh
 set -eu
+check_clients
 actual=$(tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}')
 test "$actual" = "$expected"
+before=$(tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_dead}|#{cursor_x}|#{cursor_y}')
 screen=$(tmux -L "$name" capture-pane -p -t "$pane")
+check_clients
+after=$(tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_dead}|#{cursor_x}|#{cursor_y}')
+test "$before" = "$after"
 tail=$(printf '%s\n' "$screen" | sed 's/[[:blank:]]*$//' | sed '/^$/d' | tail -n 1)
 test "$tail" = "$idle"
+check_clients
 tmux -L "$name" send-keys -t "$pane" -l -- "echo \"__TV_RUN_BEGIN_${nonce}__\""
+check_clients
 tmux -L "$name" send-keys -t "$pane" Enter
 ```
 
@@ -471,12 +525,19 @@ automatically after an uncertain send.
 
 ```sh
 set -eu
+check_clients
 actual=$(tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}')
 test "$actual" = "$expected"
+before=$(tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_dead}|#{cursor_x}|#{cursor_y}')
 screen=$(tmux -L "$name" capture-pane -p -t "$pane")
+check_clients
+after=$(tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}|#{pane_dead}|#{cursor_x}|#{cursor_y}')
+test "$before" = "$after"
 tail=$(printf '%s\n' "$screen" | sed 's/[[:blank:]]*$//' | sed '/^$/d' | tail -n 1)
 test "$tail" = "$idle"
+check_clients
 tmux -L "$name" send-keys -t "$pane" -l -- "$command"
+check_clients
 tmux -L "$name" send-keys -t "$pane" Enter
 ```
 

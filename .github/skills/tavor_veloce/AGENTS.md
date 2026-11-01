@@ -92,6 +92,73 @@ flush/close it, then atomically replace `progress.json` (for example with
 remove an owned leftover on failure. If saving fails, report it and stop
 before continuing; do not claim state was saved or perform a remote action.
 Keep this single progress file through session end for the user's review.
+Save failures propagate out of the controller: do not catch one as a remote
+failure and attempt another save or remote operation.
+
+## Shared terminal ownership and observation
+
+These gates apply to source preparation/recovery and launch control:
+
+- Preserve tmux's recorded `pane_pid` (the existing `shell_pid` field) as
+  terminal identity. It may be a login-shell wrapper, not the interpreter.
+  Before sourcing, record the actual foreground CSH PID, executable and
+  process start identity separately as `foreground_shell_pid`,
+  `foreground_shell_path` and `foreground_shell_start_time`. Verify its tty
+  and foreground process group read-only. On resume, compare those identities;
+  PID inequality with the wrapper is not evidence of shell replacement.
+  For older envelopes, establish missing foreground evidence read-only before
+  input; unknown or replaced interpreter identity does not authorize reuse.
+- A user may observe through a read-only tmux client. Before/after captures
+  and immediately before literal input and Enter, verify that every attached
+  client positively reports `client_readonly=1` and the count matches
+  `session_attached`. Writable, unsupported, empty or inconsistent flags stop
+  automation, even if someone promises not to type. Rejected input is never
+  replayed automatically. This gate is not atomic against an outside typist.
+- Keep metadata checks before/after capture and use separate joined history
+  (`capture-pane -J`) and unjoined screen for cursor checks. tmux 2.7 does not
+  support `capture-pane -N`; default captures strip trailing spaces, while
+  `-J` preserves them but joins wrapped rows. Check the known prompt's trailing
+  space/cursor explicitly, not a trimmed row alone.
+
+Define this common POSIX gate before the source/run manual recipes. Before
+calling it, set `name` and `pane` to the validated socket/session name and pane.
+The private socket and session share `name` in these recipes:
+
+```sh
+check_clients() {
+    attached=$(tmux -L "$name" display-message -p -t "$pane" '#{session_attached}') || return 1
+    case "$attached" in ''|*[!0-9]*) return 1;; esac
+    [ "$attached" != 0 ] || return 0
+    flags=$(tmux -L "$name" list-clients -t "$name" -F '#{client_readonly}') || return 1
+    printf '%s\n' "$flags" | awk -v n="$attached" \
+        'BEGIN {ok=1} $0!="1" {ok=0} END {exit !(ok && NR==n)}'
+}
+```
+
+## Approved source live recovery
+
+Missing post-source diagnostics are **source verification incomplete**, not
+proof that Veloce failed or that queued commands were consumed. Keep normal
+marked-source verification strict. Only the source skill's separate live
+recovery path may establish readiness without historical completion/status.
+
+Approval must be explicit and saved before recovery input, tied to the exact
+alias, remote user, build/emulation and terminal/foreground identities.
+General launch-plan approval, old choices and readiness flags do not count.
+Save this under source `selection.live_recovery_approval`, including
+`approved`, UTC `approved_at` and the approved context. Changed context
+requires new approval, not silently retargeting the old one.
+
+Preserve source diagnostics and retired history. Recovered source verification
+uses `completion_basis: approved_live_revalidation` and
+`source_exit_status: null` when historical status is unknown; it does not
+assert successful historical sourcing. Known source errors/status failure
+or failed tool checks cannot be waived by this path. Existing
+`session_only_live_revalidation` provenance remains historical; do not rewrite
+it, reset the schema, or manufacture missing exit status in older envelopes.
+Inspect every retained launch first. A possibly live/uncertain launch blocks
+CSH recovery probes; approval never permits re-source, replacement, cleanup,
+interruption, duplicate dispatch, or a new launch without command confirmation.
 
 ## Legacy migration
 

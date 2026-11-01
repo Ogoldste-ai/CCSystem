@@ -34,6 +34,11 @@ skill. Show commands before execution; capture SSH exit code, stdout and
 stderr separately. Pane capture is combined terminal output, not separate
 source stdout/stderr. Quote remote paths as literal arguments, never shell
 code; prevent local PowerShell expansion of remote `$` expressions.
+For multiline POSIX scripts from PowerShell, use a single-line explicit
+`sh -c` wrapper that decodes a base64 data argument into `sh -s`, passing
+quoted arguments separately. Show both decoded commands and the wrapper;
+do not put raw multiline CSH inside nested SSH quotes. Keep every local SSH
+process bounded, normally at most 15 seconds and the remaining step budget.
 
 Confirm the emulation directory and readable `../scripts/local_env`.
 Read its source chain to establish the required shell and build root.
@@ -55,6 +60,9 @@ shell PID immediately after creation, before sourcing. If saving fails, stop.
 Require a live tcsh/csh pane in the selected directory before sending input.
 Normalize a leading login-shell dash and executable path in tmux's command
 name, then compare the basename to `tcsh`/`csh`.
+Apply `AGENTS.md`'s foreground-interpreter and read-only-client gates. Record
+the actual interpreter PID/executable/start identity separately from tmux's
+pane PID before sourcing; a login wrapper is not a replacement interpreter.
 Do not send commands to an existing Veloce process, unrelated pane, or shell
 whose identity or idleness cannot be established.
 
@@ -67,6 +75,11 @@ Only standalone begin/end lines containing this operation's nonce count.
 Normalize tmux capture's right-padding spaces before comparing lines.
 Echoed command text, a prompt, or an earlier operation's output is not proof.
 If markers are lost from capture history, fail rather than guess.
+If two identity-stable observations instead show the original CSH at its
+empty owner prompt but post-source markers are missing, end the marker wait
+early and record `failed` / `source_verification_incomplete`. Report unknown
+historical source status, retain diagnostics and offer the separate approved
+recovery below. Do not keep waiting for old markers or automatically re-source.
 
 Inspect only the fresh marked output. All these conditions are required:
 
@@ -90,6 +103,45 @@ After passing, verify the idle owner prompt and pane identity again. Set
 fresh probe before recording `completed` / `environment_verified`.
 Leave the shell alive. Report the observed version, host/build/emulation,
 socket/session/pane identity and checkpoint location as **environment ready**.
+For this normal path record `completion_basis: marked_source` and the
+immediately captured `source_exit_status: 0`.
+
+### 3a. Explicitly approved live recovery
+
+Use only when post-source markers/status are missing, attributable normal
+source output is retained, and no source errors, known nonzero status or failed
+tool checks were observed. Lost/ambiguous source evidence is not eligible.
+Normal Veloce output and a prompt alone never prove readiness.
+
+1. Inspect all existing/retired attempts on their recorded identities first.
+   A possible launch, busy/replaced shell, missing identity or writable/unknown
+   client blocks input. Verify the unchanged original foreground CSH, current
+   empty owner prompt/cursor and selected cwd with two read-only snapshots.
+   Do not run the creation/source recipe again.
+2. Ask for explicit live-recovery approval for this exact saved context;
+   save `selection.live_recovery_approval` per `AGENTS.md` before any probe.
+   No approval means remain unverified with no recovery input.
+3. Revalidate connection/canonical build/emulation paths read-only. In the
+   same idle pane, send an independent fresh nonce-tagged probe for `tv_owner`,
+   CSH `$ROOT_DIR`, `$cwd` and the four allowlisted tool variables. Require
+   fresh standalone markers/values, canonical root equality and accessible
+   tool directories. Do not use `printenv` as proof of CSH-only variables,
+   repair cwd with `cd`, or read the historical source status from current
+   `$status`. Missing/error evidence stops recovery, not a repeated probe.
+4. Only after those checks, separately set `tv_ready` to the fresh recovery
+   nonce and independently read it back in the unchanged idle pane. Save
+   `completed` / `environment_verified`, `completion_basis:
+   approved_live_revalidation`, unknown historical `source_exit_status: null`,
+   observed values/foreground identity and UTC `verified_at`. Preserve prior
+   diagnostics and retired entries; do not label the old source exit zero.
+
+Bound recovery observation to a new 30-second monotonic budget, with each SSH
+call normally at most 15 seconds and capped by remaining time. This is not a
+renewal of the old source wait. Save approval/provenance and every outcome in
+the same shared file; save failure stops all operations. Report **live
+environment readiness**, with historical source completion still unknown.
+Recovery approval does not authorize make; run-emulation still asks for straps
+and explicit final-command confirmation.
 
 ### 4. Checkpoint and resume
 
@@ -104,7 +156,9 @@ a Veloce configuration or environment backup.
   emulation name/path, plus generated `tmux_name`.
 - `verification`: observed tmux session ID/creation time, pane ID, shell
   PID/path, operation nonce, version, root/cwd, allowlisted tool checks and
-  `verified_at`. Unknown fields are `null`.
+  `verified_at`, plus foreground interpreter identity, completion basis and
+  nullable source exit status. Unknown fields are `null`. These are additive
+  fields, not a schema migration.
 - Save atomically after context selection, shell creation, before sourcing,
   and after verification or failure, following the shared JSON envelope.
 - On timeout/error, save `failed` and a concise `last_error`; clear environment
@@ -118,6 +172,11 @@ a Veloce configuration or environment backup.
   source chain. Require the recorded readiness nonce, expected paths and
   accessible tools. A missing/busy/replaced shell is not ready; stop instead
   of injecting input or silently creating another session.
+  Apply the shared foreground/client gates, including for approved recovered
+  readiness. An older envelope without completion-basis fields follows the
+  existing live resume checks; do not invent historical status. Failed source
+  verification without readiness requires section 3a approval, not normal
+  resume or silent repair.
 - Changing host/build/emulation or a failed prerequisite invalidates this
   readiness and `local_tavor_veloce_run-emulation` transitively. Before any invalidation,
   failure, re-source or replacement, preserve old source/terminal/attempt
@@ -133,6 +192,9 @@ These are **remote POSIX controller-shell recipes**, not local PowerShell
 commands. Source runs inside the CSH pane. Set `emu` to the verified absolute
 emulation path, and `name`/`token` to fresh generated identifiers as above.
 Pass these as safely quoted arguments when controlling SSH from Windows.
+Define `check_clients` from `AGENTS.md` before these recipes. For
+identity-stable framed captures use run-emulation's **Inspect without sending**
+recipe; that reference never authorizes running emulation.
 
 ### Create the shell
 
@@ -165,26 +227,31 @@ echo "__TV_CWD_${token}__=\$cwd"
 echo "__TV_END_${token}__"
 EOF
 )
+check_clients
 tmux -L "$name" send-keys -t "$pane" -l -- "$payload"
+check_clients
 tmux -L "$name" send-keys -t "$pane" Enter
 ```
 
 Literal sending prevents tmux interpreting command text as key names.
 Separate CSH input lines capture `$status` before later commands replace it.
 The controller's escaped dollar signs deliberately reach the CSH unchanged.
+Post-source lines are intended diagnostics, not guaranteed execution. Their
+absence does not establish the cause; never replay this multiline payload to
+recreate them. Use section 3a only after its explicit approval and safety gates.
 
 ### Inspect, verify and keep the shell
 
-```sh
-set -eu
-tmux -L "$name" capture-pane -p -J -S - -t "$pane"
-tmux -L "$name" display-message -p -t "$pane" '#{session_id}|#{session_created}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}'
-```
+Use run-emulation's **Inspect without sending** recipe on this recorded socket
+and pane. Its framed joined history, unjoined current screen, client gates and
+matching metadata before/after capture are required here too; a bare history
+capture followed by one metadata read cannot verify current ownership/cursor.
 
 Repeat inspection only within the 120-second deadline. Apply every success
 check above; do not equate capture success with source success. After those
 checks and a fresh idle-identity check, send `set tv_ready = "<token>"` plus
 Enter literally and probe its value in the same shell.
+Apply the same client/foreground/idle gates before each readiness input.
 
 Later commands must use this recorded socket and pane. A new SSH shell, or
 `tmux run-shell`, does not inherit the pane's CSH variables/environment.

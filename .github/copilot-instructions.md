@@ -37,9 +37,18 @@ repo that matches its purpose:
                     shared-module-convert-test-and-parm/
                     weekly-mail/  (weekly WW status mail drafter)
                     hebrew-pdf-text-edit/  (edit text inside Hebrew PDFs)
-.github/agents/   Custom agent definitions (must live under .github/ for the
-                  Copilot CLI to recognize them; reserved, populate as
-                  agents mature)
+                    _group-template/  (template for bundling many skills into
+                                       one plugin; see its README)
+                    tavor_veloce/
+                      AGENTS.md  (checkpoint rule for current/future skills)
+                      local_tavor_veloce_xwave-on/  (manual Xwave/Visualizer reminder)
+                      local_tavor_veloce_connect-to-veloce-machine/  (SSH to cm5/cm6)
+                      local_tavor_veloce_active-emulation/  (choose build and emu_* directory)
+                      local_tavor_veloce_source-environment/  (prepare a persistent tmux/CSH shell)
+                      local_tavor_veloce_run-emulation/  (choose straps; launch once to VSIM CLI)
+.github/agents/   Custom agent definitions, including the ilabu21 RAG
+                  operator (must live under .github/ for the Copilot CLI
+                  to recognize them)
 copilot-marketplace/  Submodule → published marketplace (finished product)
 ec_accurev_git/       Submodule → firmware/validation work repo
 ```
@@ -52,6 +61,29 @@ changes.
 - **Adding a new skill / agent / MCP server**: build and iterate under
   `.github/skills/` or `.github/agents/` in CCSystem first. Don't add new,
   unproven items directly to `copilot-marketplace`.
+- **Grouping skills**: use `.github\skills\<group>\<skill>\SKILL.md` as described
+  in `.github\skills\_group-template\README.md`. Nested discovery was verified
+  with Copilot CLI 1.0.105. `group.json` is local bookkeeping, not a Copilot
+  manifest or an automated promotion mechanism.
+- **Tavor Veloce state**: every skill under `.github\skills\tavor_veloce\`
+  must follow that group's `AGENTS.md` and use the single ignored per-session
+  `.copilot\state\tavor_veloce\<session-id>\progress.json`. All skills' progress/
+  status lives under `skills["<skill-name>"]`; never create per-skill files.
+  Save each user selection immediately, preserving other entries and applying
+  dependent invalidations in one atomic save. Apply this to future skills too.
+  Keep the file after each session for user review. Saved choices
+  do not prove a live SSH connection or successful emulator action.
+  `local_tavor_veloce_source-environment` follows `local_tavor_veloce_active-emulation`, leaves a verified tmux/CSH
+  shell for future commands, and does not launch Veloce. Its entry records
+  readiness; environment changes live in the remote pane, not in the JSON.
+  `local_tavor_veloce_run-emulation` follows verified source readiness in that exact pane and
+  records straps, guarded dispatch and a fresh numbered VSIM CLI prompt in
+  its entry in that same file. Inspect existing attempts read-only before
+  any source skill/CSH probe. Host/build/emulation/source invalidation clears
+  launch readiness but retains old terminal/attempt identity in
+  `skills["local_tavor_veloce_run-emulation"].verification.retired_attempts`; it never authorizes
+  interruption, re-source, cleanup or a duplicate launch. CLI ready is not
+  boot complete.
 - **Promoting something to the marketplace**: only do this when the user
   explicitly requests it. When requested:
   1. Package it under `copilot-marketplace/plugins/<name>/`, with a

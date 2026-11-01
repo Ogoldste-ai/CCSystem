@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from .backends.base import MessageSource
+from .backends.filedrop import FileDropBackend
 from .config import GRAPH, TeamsConfig
+from .filedrop_scan import FileDropScanner
 from .models import Message
 from .sender import WebhookSender
 from .store import SeenStore
@@ -31,7 +34,14 @@ def build_server(config: TeamsConfig | None = None) -> FastMCP:
     backend = build_backend(config)
     webhook = WebhookSender(config)
     store = SeenStore(config.state_file)
+    scanner = FileDropScanner(config)
     server = FastMCP("teams")
+
+    async def fetch_messages(chat_id: str, since: str = "", limit: int = 50) -> list[Message]:
+        if isinstance(backend, FileDropBackend):
+            scan = await scanner.scan()
+            return backend.fetch_messages(chat_id=chat_id, since=since, limit=limit, scan=scan)
+        return backend.fetch_messages(chat_id=chat_id, since=since, limit=limit)
 
     @server.tool()
     def health() -> dict[str, Any]:
@@ -54,54 +64,74 @@ def build_server(config: TeamsConfig | None = None) -> FastMCP:
         return info
 
     @server.tool()
-    def list_chats(limit: int = 20) -> list[dict[str, Any]]:
+    async def list_chats(limit: int = 20) -> list[dict[str, Any]]:
         """List your Teams chats, most recently active first.
 
         Use this to find the chat_id needed by read_messages and reply_to_chat.
         """
+        if isinstance(backend, FileDropBackend):
+            scan = await scanner.scan()
+            return [chat.to_dict() for chat in backend.list_chats(limit=limit, scan=scan)]
         return [chat.to_dict() for chat in backend.list_chats(limit=limit)]
 
     @server.tool()
-    def read_messages(chat_id: str = "", since: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    async def read_messages(
+        chat_id: str = "", since: str = "", limit: int = 50
+    ) -> list[dict[str, Any]]:
         """Read messages from one chat, oldest first.
 
         `since` is an ISO-8601 timestamp; only later messages are returned. The
         graph backend requires a chat_id, the filedrop backend treats an empty
         chat_id as "every chat".
         """
-        return _as_dicts(backend.fetch_messages(chat_id=chat_id, since=since, limit=limit))
+        return _as_dicts(await fetch_messages(chat_id=chat_id, since=since, limit=limit))
 
     @server.tool()
-    def get_message(message_id: str, chat_id: str = "") -> dict[str, Any]:
+    async def get_message(message_id: str, chat_id: str = "") -> dict[str, Any]:
         """Fetch a single message by id."""
-        for message in backend.fetch_messages(chat_id=chat_id, limit=200):
+        for message in await fetch_messages(chat_id=chat_id, limit=200):
             if message.id == message_id:
                 return message.to_dict()
         return {"found": False, "message_id": message_id}
 
     @server.tool()
-    def check_new_messages(limit: int = 25, mark_seen: bool = True) -> dict[str, Any]:
+    async def check_new_messages(limit: int = 25, mark_seen: bool = True) -> dict[str, Any]:
         """Messages that have arrived since the last time this tool was called.
 
         This is the "did anyone message me?" alert. Already-reported messages are
         suppressed, so it is safe to call repeatedly. Pass mark_seen=false to peek
-        without consuming them.
+        without consuming them. Filedrop checks return complete=false and a
+        warning if some files are unavailable or the scan deadline is exceeded.
+        Incomplete checks never mark messages seen, even when mark_seen=true.
         """
-        recent = backend.fetch_recent(limit=max(limit * 2, limit))
+        scan = None
+        if isinstance(backend, FileDropBackend):
+            scan = await scanner.scan()
+            recent = scan.recent(limit=max(limit * 2, limit))
+        else:
+            recent = backend.fetch_recent(limit=max(limit * 2, limit))
         fresh = [
             message
             for message in recent
             if message.id and not store.has_seen(message.id) and not message.is_from_me
         ]
         fresh = fresh[:limit]
-        if mark_seen and fresh:
+        should_mark = mark_seen and (scan is None or scan.complete)
+        await asyncio.sleep(0)
+        if should_mark and fresh:
             store.mark_seen(message.id for message in fresh)
             store.save()
-        return {
+        response: dict[str, Any] = {
             "new_count": len(fresh),
-            "marked_seen": bool(mark_seen and fresh),
+            "marked_seen": bool(should_mark and fresh),
             "messages": _as_dicts(fresh),
         }
+        if scan is not None:
+            response["complete"] = scan.complete
+            response["scan"] = scan.diagnostics()
+            if not scan.complete:
+                response["warning"] = scan.warning() + " No messages were marked seen."
+        return response
 
     @server.tool()
     def reply_to_chat(chat_id: str, body: str) -> dict[str, Any]:

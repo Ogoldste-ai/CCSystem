@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config import TeamsConfig
+from ..filedrop_scan import ScanResult
 from ..models import Chat, Message, parse_timestamp, strip_html
+
+_REMOTE_CONTENT_ATTRIBUTES = 0x00400000 | 0x00001000  # RECALL_ON_DATA_ACCESS | OFFLINE
 
 # Power Automate's JSON shape depends on how the flow is authored, so accept the
 # handful of spellings a reasonable flow produces rather than forcing one.
@@ -68,26 +73,48 @@ class FileDropBackend:
             info["messages_on_disk"] = sum(1 for _ in inbox.glob("*.json"))
         return info
 
-    def _load_all(self) -> list[Message]:
-        messages: list[Message] = []
+    def scan(self, report: Callable[[ScanResult], None] | None = None) -> ScanResult:
+        started = time.perf_counter()
+        result = ScanResult()
         for path in self._inbox().glob("*.json"):
+            result.files_scanned += 1
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                # A file mid-sync is normal; skip it and pick it up next call
-                # rather than failing the whole listing.
-                continue
-            if isinstance(payload, list):
-                messages.extend(self._parse(item, path) for item in payload if isinstance(item, dict))
-            elif isinstance(payload, dict):
-                if isinstance(payload.get("value"), list) and any(
-                    isinstance(item, dict) and "subscriptionId" in item
-                    for item in payload["value"]
-                ):
-                    continue
-                messages.append(self._parse(payload, path))
-        messages.sort(key=lambda item: item.sort_key())
-        return messages
+                attributes = getattr(path.stat(), "st_file_attributes", 0)
+                if attributes & _REMOTE_CONTENT_ATTRIBUTES:
+                    result.deferred_files += 1
+                else:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(payload, list):
+                        result.messages.extend(
+                            self._parse(item, path) for item in payload if isinstance(item, dict)
+                        )
+                        if any(not isinstance(item, dict) for item in payload):
+                            result.invalid_files += 1
+                    elif isinstance(payload, dict):
+                        notification = isinstance(payload.get("value"), list) and any(
+                            isinstance(item, dict) and "subscriptionId" in item
+                            for item in payload["value"]
+                        )
+                        if not notification:
+                            result.messages.append(self._parse(payload, path))
+                    else:
+                        result.invalid_files += 1
+            except OSError:
+                result.unreadable_files += 1
+            except ValueError:
+                result.invalid_files += 1
+            if report is not None:
+                report(result)
+        result.finished = True
+        result.elapsed_ms = (time.perf_counter() - started) * 1000
+        if report is not None:
+            report(result)
+        return result
+
+    def _load_all(self, scan: ScanResult | None = None) -> list[Message]:
+        result = scan if scan is not None else self.scan()
+        result.require_complete()
+        return sorted(result.messages, key=lambda item: item.sort_key())
 
     def _parse(self, payload: dict[str, Any], path: Path) -> Message:
         raw_body = _first(payload, _BODY_KEYS)
@@ -105,9 +132,9 @@ class FileDropBackend:
             web_url=_first(payload, _URL_KEYS),
         )
 
-    def list_chats(self, limit: int = 20) -> list[Chat]:
+    def list_chats(self, limit: int = 20, *, scan: ScanResult | None = None) -> list[Chat]:
         chats: dict[str, Chat] = {}
-        for message in self._load_all():
+        for message in self._load_all(scan):
             if not message.chat_id:
                 continue
             chat = chats.get(message.chat_id)
@@ -121,25 +148,22 @@ class FileDropBackend:
         ordered = sorted(chats.values(), key=lambda item: item.last_updated, reverse=True)
         return ordered[:limit]
 
-    def fetch_messages(self, chat_id: str, since: str = "", limit: int = 50) -> list[Message]:
+    def fetch_messages(
+        self, chat_id: str, since: str = "", limit: int = 50, *, scan: ScanResult | None = None
+    ) -> list[Message]:
         cutoff = parse_timestamp(since)
         selected = [
             message
-            for message in self._load_all()
+            for message in self._load_all(scan)
             if (not chat_id or message.chat_id == chat_id)
             and (cutoff is None or message.sort_key() > cutoff)
         ]
         return selected[-limit:] if limit > 0 else selected
 
     def fetch_recent(self, since: str = "", limit: int = 50) -> list[Message]:
-        cutoff = parse_timestamp(since)
-        selected = [
-            message
-            for message in self._load_all()
-            if cutoff is None or message.sort_key() > cutoff
-        ]
-        selected.reverse()
-        return selected[:limit] if limit > 0 else selected
+        result = self.scan()
+        result.require_complete()
+        return result.recent(since=since, limit=limit)
 
     def send_reply(self, chat_id: str, body: str) -> dict[str, Any]:
         self.config.require_ready()

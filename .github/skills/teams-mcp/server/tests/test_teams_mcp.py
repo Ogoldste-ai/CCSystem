@@ -8,6 +8,7 @@ import pytest
 from teams_mcp.backends.filedrop import FileDropBackend
 from teams_mcp.backends.graph import GraphApiError, GraphBackend
 from teams_mcp.config import FILEDROP, GRAPH, TeamsConfig, TeamsWriteDisabledError
+from teams_mcp.filedrop_scan import FileDropScanError
 from teams_mcp.models import Message, parse_timestamp, strip_html
 from teams_mcp.sender import WebhookError, WebhookSender
 from teams_mcp.store import SeenStore
@@ -231,13 +232,16 @@ def test_filedrop_ignores_notification_only_files(tmp_path):
     assert [message.body for message in FileDropBackend(config).fetch_recent()] == ["hello"]
 
 
-def test_filedrop_skips_malformed_files(tmp_path):
-    """A file caught mid-sync must not break the whole listing."""
+def test_filedrop_reports_malformed_files(tmp_path):
     config = make_config(tmp_path)
     (config.inbox_dir / "broken.json").write_text("{not json", encoding="utf-8")
     drop(config.inbox_dir, "ok.json", {"id": "3", "chatId": "c", "body": "fine"})
-    messages = FileDropBackend(config).fetch_messages("c")
-    assert [message.id for message in messages] == ["3"]
+    backend = FileDropBackend(config)
+    scan = backend.scan()
+    assert [message.id for message in scan.messages] == ["3"]
+    assert scan.invalid_files == 1 and not scan.complete
+    with pytest.raises(FileDropScanError, match="Incomplete Teams inbox scan"):
+        backend.fetch_messages("c")
 
 
 def test_filedrop_since_filter(tmp_path):

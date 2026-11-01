@@ -86,7 +86,7 @@ Read:
 - `read_messages(chat_id, since="", limit=50)` - oldest first
 - `get_message(message_id, chat_id="")`
 - `check_new_messages(limit=25, mark_seen=True)` - **the alert**; suppresses
-  anything already reported, so it is safe to call repeatedly
+  messages reported by complete checks; incomplete checks never consume messages
 
 Write - requires `TEAMS_ALLOW_WRITE`:
 
@@ -109,14 +109,27 @@ One webhook = one destination. Messaging someone else means another webhook.
 
 ## Workflow - catch up and reply
 
-1. `check_new_messages()` - what arrived since last time. Returns nothing on a
-   second call, so it will not re-report the same messages.
+1. `check_new_messages()` - what arrived since last time. For filedrop, inspect
+   `complete` and `warning` before summarizing. A complete check suppresses
+   already-reported messages; an incomplete check may repeat available messages.
 2. `read_messages(chat_id)` for context on anything that needs a real answer.
 3. Draft the reply and **show the exact text to the user for approval**.
 4. `reply_to_chat(chat_id, body)` once approved.
 
 ## Notes
 
+- Filedrop scans have a **3-second budget** and defer offline/cloud-only files
+  rather than waiting for OneDrive downloads. Incomplete results include scan
+  diagnostics and **do not mark any messages seen**, even with `mark_seen=True`.
+  Always surface the warning; never describe an empty partial response as
+  "no new messages."
+- Recommend **Always keep on this device** for the inbox and wait for downloads
+  to finish. Do not change that setting without approval. This speeds local
+  reads, not upstream Power Automate/OneDrive delivery.
+- `list_chats`, `read_messages`, and `get_message` raise errors if the inbox
+  cannot be scanned completely. Do not present those errors as empty history.
+- Do not blindly retry a timed-out MCP call. Restore/reload a stuck old
+  connection first; updated scans stop their worker on timeout or cancellation.
 - **Replies post under the user's own Teams identity.** Recipients cannot tell a
   drafted reply from a typed one. Always confirm the exact wording first - this
   matters more than it does for a GitLab comment.
@@ -125,5 +138,6 @@ One webhook = one destination. Messaging someone else means another webhook.
 - `filedrop` replies are **queued, not sent** - the file must sync and the flow
   must poll before the message appears in Teams. `reply_to_chat` says so in its
   result.
-- Files caught mid-sync are skipped rather than failing the whole listing.
+- Files caught mid-sync are reported as unreadable/invalid and retried on the
+  next scan; a partial check never silently claims that the inbox is complete.
 - Do not log or hardcode tokens, client ids, or flow URLs.

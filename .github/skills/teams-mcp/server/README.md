@@ -152,6 +152,49 @@ trigger on a temporary file that disappears during the rename.
 Prerequisite: a synced work folder. OneDrive **for Business** or a SharePoint
 library - the consumer OneDrive is not reachable by the standard connectors.
 
+### Fast inbox checks and incomplete results
+
+In File Explorer, right-click the local inbox and choose **Always keep on this
+device** if you want the complete inbox available without cloud retrieval.
+Wait for OneDrive to finish downloading; setting the pin alone does not mean
+all contents are already local.
+
+Filedrop reads run in one short-lived scan worker with a **3-second scan budget**,
+including startup. The worker checks file attributes before opening content and
+defers Windows files marked as offline or requiring remote data. An unexpectedly
+blocked scan is killed and reaped on deadline or cancellation, rather than
+blocking the MCP event loop. Concurrent reads fail promptly with an "already
+running" error instead of queuing more scans. Health does not wait for the worker
+and does not read message content.
+
+`check_new_messages` retains `new_count`, `marked_seen`, and `messages`, and adds:
+
+- `complete`: whether all local inbox files were successfully scanned
+- `scan`: `files_scanned`, `deferred_files`, `unreadable_files`, `invalid_files`,
+  `timed_out`, and `elapsed_ms`
+- `warning`: present on incomplete scans, with the reason and recovery guidance
+
+Incomplete checks return available messages but **never mark them seen**, even
+with `mark_seen=True`. They may therefore repeat on the next check. An empty
+incomplete result **does not mean there are no new messages**. Download deferred
+files, resolve sync/read errors, or correct malformed JSON, then check again.
+Notification-only files are intentionally ignored and do not make a scan
+incomplete.
+
+`list_chats`, `read_messages`, and `get_message` raise an explicit error for
+incomplete scans instead of returning misleading lists or "not found."
+Scanner failures also produce tool errors, not empty successes.
+
+This bounds the cost of reading files already delivered to the local inbox; it
+does not remove Teams -> Power Automate -> OneDrive polling and sync delays.
+Every scan still considers the inbox, so lowering the result limit does not avoid
+file reads. The HTTP client timeout applies to Graph/webhook requests, not these
+file reads. There is no parsed-message cache to become stale after sync changes.
+
+After updating this editable install, reload the MCP client before using the
+new behavior. If an old process is stuck in a content read, restore/reload the
+connection instead of blindly repeating the timed-out call.
+
 ## Sending: the Workflows webhook
 
 **This is the fastest path to actually sending a Teams message.** It needs no
@@ -240,4 +283,8 @@ a fake HTTP client and `filedrop` against a temp directory.
 | `Interactive sign-in required` | Expected on first `graph` use; complete the device code, then retry |
 | Graph 403 mentioning consent | Admin has not granted `Chat.Read`/`Chat.ReadWrite` |
 | `filedrop` returns nothing | Check the flow ran and the folder actually synced locally |
+| `complete: false`, `deferred_files` is nonzero | Use **Always keep on this device** for the inbox and wait for OneDrive downloads |
+| `complete: false`, read/JSON errors | Wait for sync to finish, check access, and correct malformed message files |
+| `timed_out: true` | The scan worker was stopped; resolve local filesystem/OneDrive stalls before retrying |
+| `A Teams inbox scan is already running` | Let the active scan finish or reach its deadline; do not queue retries |
 | Reply queued but never appears | Outbound flow not running, or watching the wrong folder |

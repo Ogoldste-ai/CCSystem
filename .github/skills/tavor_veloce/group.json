@@ -1,0 +1,16 @@
+{
+  "name": "tavor_veloce",
+  "description": "SSH connection, build and emulation selection, persistent environment preparation, guarded CLI startup, and manual references for Tavor Veloce",
+  "version": "1.0.0",
+  "author": {
+    "name": "Oren Goldstein",
+    "email": "oren.goldstein@nuvoton.com"
+  },
+  "skills": [
+    "local_tavor_veloce_xwave-on",
+    "local_tavor_veloce_connect-to-veloce-machine",
+    "local_tavor_veloce_active-emulation",
+    "local_tavor_veloce_source-environment",
+    "local_tavor_veloce_run-emulation"
+  ]
+}

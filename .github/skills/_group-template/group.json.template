@@ -1,0 +1,13 @@
+{
+  "name": "shared-skills-topic",
+  "description": "One-line description of the bundle",
+  "version": "1.0.0",
+  "author": {
+    "name": "Oren Goldstein",
+    "email": "oren.goldstein@nuvoton.com"
+  },
+  "skills": [
+    "skill-a",
+    "skill-b"
+  ]
+}

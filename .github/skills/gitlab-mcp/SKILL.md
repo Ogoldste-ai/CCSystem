@@ -35,6 +35,68 @@ Use this skill when you need to:
 - list repository branches, optionally filtered by name or tip-commit author
 - inspect an issue, including notes
 - resolve a GitLab project from `group/project` or numeric project id
+- find out why a pipeline failed - quick answer only, see **Effort limit**
+
+## Effort limit - answer quickly or STOP
+
+"Why did pipeline X fail?" and "why is MR !N blocked?" must get a quick answer:
+at most 6 GitLab calls in total (MCP tools and the REST calls below together),
+then reply. Deep research is never the default.
+
+For a blocked MR, `get_merge_request_review_status(iid)` is the answer. If it
+shows a failed pipeline, continue with step 2 below.
+
+Pipeline failure recipe - these are the only steps:
+
+1. Take the pipeline id the user gave, or `head_pipeline` from
+   `get_merge_request(iid)`.
+2. `get_pipeline_jobs(pipeline_id, scope="failed")` gives the failed job, its
+   `failure_reason`, and `web_url`.
+3. If the pipeline failed but no job is listed, the failure is in a child
+   pipeline (trigger jobs are not returned). Get the child id with the bridges
+   call below, then repeat step 2 on the child pipeline.
+4. Read the last 100 lines of that one failed job's log.
+5. Reply with the job name, its `failure_reason` and meaning (table below), and
+   the first real error line from the log tail.
+
+```powershell
+$api = 'https://gitlab2.nuvoton.co.il/api/v4'
+$p = 'validation%2Fec_accurev_git'   # URL-encoded project path, or numeric id
+$h = @{ 'PRIVATE-TOKEN' = [Environment]::GetEnvironmentVariable('GITLAB_TOKEN', 'User') }
+
+# Step 3 - child pipeline of a failed trigger job. The parentheses make
+# Windows PowerShell pass each array item down the pipeline.
+(Invoke-RestMethod -Headers $h "$api/projects/$p/pipelines/<pipeline_id>/bridges") |
+  Select-Object name, status, @{ n = 'child'; e = { $_.downstream_pipeline.id } }
+
+# Step 4 - last 100 lines of one job log, without color codes
+$log = Invoke-RestMethod -Headers $h "$api/projects/$p/jobs/<job_id>/trace"
+($log -replace '\e\[[0-9;]*[A-Za-z]', '') -split "`n" | Select-Object -Last 100
+```
+
+| `failure_reason` | Meaning to report |
+|---|---|
+| `script_failure` | A command in the job failed. Quote the first real error. |
+| `stuck_or_timeout_failure`, `no_updates_running` | GitLab dropped the job: the runner stopped responding or never picked it up. Infrastructure problem; suggest a retry. |
+| `job_execution_timeout` | The job ran past its time limit. Quote where the log stops. |
+| `runner_system_failure` | Runner or host problem. Suggest a retry. |
+| anything else | Report the value as-is. |
+
+**If the cause is still unclear after these steps, STOP.** Reply "This is too
+complicated to answer quickly", list what you found (job, `failure_reason`,
+job URL, last error line), and wait.
+
+**Exception:** go beyond this limit only when the user explicitly asks for a
+deeper investigation, either in the request or after your STOP reply.
+
+Red flags - each one means STOP and say it is too complicated:
+
+- comparing with other pipelines, jobs, merge requests, or runners
+- scanning job history or runner history
+- reading GitLab, runner, or CI-script source code or documentation
+- analyzing the MR diff or the local checkout to explain a CI failure
+- downloading or searching a whole log, or reading more than one log
+- "I already have the answer, but let me confirm it once more"
 
 ## Required environment
 
@@ -121,8 +183,8 @@ Write - all require `GITLAB_ALLOW_WRITE`:
    directly.
 4. `get_merge_request_approvals(iid)` for who approved, when the instance
    supports approvals.
-5. If the pipeline failed, `get_pipeline_jobs(pipeline_id, scope="failed")` names
-   the failing job.
+5. If the pipeline failed, follow the pipeline failure recipe in **Effort
+   limit** above - nothing more.
 
 ## Workflow B - reviewing a merge request assigned to me
 

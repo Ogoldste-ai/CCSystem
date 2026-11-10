@@ -3,12 +3,20 @@ from __future__ import annotations
 import os
 import re
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Iterable, Iterator
 
 from .config import OutlookConfig, OutlookUnavailableError
 from .formatting import split_addresses
+from .scheduling import (
+    DEFAULT_WORKDAYS,
+    find_common_slots,
+    parse_clock,
+    parse_when,
+    parse_workdays,
+)
+from .teams_ui import insert_teams_link
 
 OL_FOLDER_INBOX = 6
 OL_FOLDER_SENT = 5
@@ -34,6 +42,11 @@ IMPORTANCE = {0: "low", 1: "normal", 2: "high"}
 BUSY_STATUS = {0: "free", 1: "tentative", 2: "busy", 3: "out_of_office", 4: "working_elsewhere"}
 
 OL_REQUIRED, OL_OPTIONAL = 1, 2
+
+# OlMeetingStatus.olMeeting; OlInspectorClose save/discard; OlItemType for CreateItem.
+OL_MEETING = 1
+OL_SAVE, OL_DISCARD = 0, 1
+OL_CREATE_APPOINTMENT = 1
 
 # OlAttachmentType. olByValue is the ordinary "a file is attached" case.
 OL_BY_VALUE, OL_BY_REFERENCE, OL_EMBEDDED_ITEM, OL_OLE = 1, 4, 5, 6
@@ -169,6 +182,19 @@ def _to_iso(value: Any) -> str:
     return ""
 
 
+def _local_time(value: datetime) -> datetime:
+    return value.astimezone().replace(tzinfo=None) if value.tzinfo else value
+
+
+def _received_bound(text: str) -> datetime | None:
+    if not text.strip():
+        return None
+    try:
+        return datetime.fromisoformat(text.strip()).astimezone(timezone.utc)
+    except ValueError as exc:
+        raise ValueError("Received bounds must be ISO dates or date/times.") from exc
+
+
 _SMTP_IN_PARENS = re.compile(r"\(([^()\s]+@[^()\s]+)\)")
 
 
@@ -226,10 +252,16 @@ class OutlookClient:
     Outlook installed; nothing else should pass it.
     """
 
-    def __init__(self, config: OutlookConfig, app: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: OutlookConfig,
+        app: Any | None = None,
+        teams_inserter: Any = insert_teams_link,
+    ) -> None:
         self.config = config
         self._app = app
         self._namespace: Any | None = None
+        self._teams_inserter = teams_inserter
 
     # ---------------------------------------------------------------- plumbing
 
@@ -758,16 +790,35 @@ class OutlookClient:
         from_contains: str = "",
         subject_contains: str = "",
         stats: dict[str, Any] | None = None,
+        offset: int = 0,
+        received_after: str = "",
+        received_before: str = "",
     ) -> list[dict[str, Any]]:
+        if offset < 0:
+            raise ValueError("offset must be nonnegative.")
+        lower = _received_bound(received_after)
+        upper = _received_bound(received_before)
+        if lower is not None and upper is not None and lower >= upper:
+            raise ValueError("received_after must be earlier than received_before.")
+        if days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            lower = max(lower, cutoff) if lower is not None else cutoff
         folder = self.resolve_folder(folder_path)
         resolved_path = self._folder_path(folder)
         items = folder.Items
 
-        if days > 0:
-            cutoff = datetime.now() - timedelta(days=days)
-            # Outlook's Restrict parser wants US-style dates regardless of locale.
-            stamp = cutoff.strftime("%m/%d/%Y %I:%M %p")
+        if lower is not None:
+            # Keep COM's wall-time restrictions broad across repeated DST hours.
+            # Exact filtering below compares UTC instants, not local clock times.
+            stamp = _local_time(lower).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).strftime("%m/%d/%Y %I:%M %p")
             items = _safe(lambda: items.Restrict(f"[ReceivedTime] >= '{stamp}'"), items)
+        if upper is not None:
+            stamp = (_local_time(upper).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(days=1)).strftime("%m/%d/%Y %I:%M %p")
+            items = _safe(lambda: items.Restrict(f"[ReceivedTime] < '{stamp}'"), items)
         if unread_only:
             items = _safe(lambda: items.Restrict("[UnRead] = True"), items)
         # Sort last, never before Restrict: Restrict returns a *new* collection
@@ -783,9 +834,9 @@ class OutlookClient:
         # full-store walk, so stop well before exhausting the folder.
         scan_cap = max(limit * 20, 200)
         count = int(_safe(lambda: items.Count, 0) or 0)
-        scanned = 0
+        scanned = min(offset, count)
         hit_limit = False
-        for index in range(1, min(count, scan_cap) + 1):
+        for index in range(offset + 1, min(count, offset + scan_cap) + 1):
             scanned = index
             item = _safe(lambda i=index: items.Item(i))
             if item is None:
@@ -799,6 +850,16 @@ class OutlookClient:
             # A mail with no entry id cannot be fetched or acted on later, so
             # reporting it would only be noise.
             if not str(_safe(lambda: item.EntryID, "") or "").strip():
+                continue
+            if lower is not None or upper is not None:
+                received = _safe(lambda: item.ReceivedTime.astimezone(timezone.utc))
+                if received is None:
+                    continue
+                if lower is not None and received < lower:
+                    continue
+                if upper is not None and received >= upper:
+                    continue
+            if unread_only and not bool(_safe(lambda: item.UnRead, False)):
                 continue
             if needle_subject and needle_subject not in str(
                 _safe(lambda: item.Subject, "") or ""
@@ -825,6 +886,7 @@ class OutlookClient:
             stats["hit_limit"] = hit_limit
             stats["scan_incomplete"] = not hit_limit and scanned < count
             stats["more_available"] = hit_limit or stats["scan_incomplete"]
+            stats["next_offset"] = scanned if scanned < count else None
         return results
 
     def get_raw(self, entry_id: str) -> dict[str, Any]:
@@ -840,9 +902,15 @@ class OutlookClient:
         item = _safe(lambda: self.namespace.GetItemFromID(entry_id))
         if item is None:
             raise OutlookUnavailableError(f"No mail item with entry_id {entry_id!r}.")
+        if _safe(lambda: item.Class) != OL_MAIL_ITEM:
+            raise OutlookUnavailableError(f"entry_id {entry_id!r} is not a mail item.")
         item.UnRead = not read
         item.Save()
-        return {"entry_id": entry_id, "unread": not read}
+        saved = self.namespace.GetItemFromID(entry_id)
+        unread = bool(saved.UnRead)
+        if unread != (not read):
+            raise OutlookUnavailableError(f"Read state was not saved for entry_id {entry_id!r}.")
+        return {"entry_id": entry_id, "unread": unread}
 
     # ------------------------------------------------------------ attachments
 
@@ -1027,6 +1095,148 @@ class OutlookClient:
             "subject": subject,
             "posted_as": "your own Outlook account - recipients cannot tell it was drafted",
         }
+
+    # --------------------------------------------------------------- meetings
+
+    def find_free_slots(
+        self,
+        attendees: str,
+        start: str,
+        end: str,
+        duration_minutes: int = 30,
+        work_start: str = "09:00",
+        work_end: str = "18:00",
+        workdays: str = DEFAULT_WORKDAYS,
+        limit: int = 10,
+        allow_tentative: bool = False,
+        include_me: bool = True,
+    ) -> dict[str, Any]:
+        """Common free slots across everyone, from Exchange free/busy data."""
+        names = split_addresses(attendees)
+        if not names and not include_me:
+            raise ValueError("attendees is required.")
+        earliest, latest = parse_when(start), parse_when(end)
+        if latest <= earliest:
+            raise ValueError("end must be after start.")
+        anchor = earliest.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        people: list[tuple[str, Any]] = []
+        if include_me:
+            people.append(("me", self.namespace.CurrentUser))
+        unresolved: list[str] = []
+        for name in names:
+            recipient = self.namespace.CreateRecipient(name)
+            if _safe(recipient.Resolve, False):
+                people.append((str(_safe(lambda r=recipient: r.Name, name) or name), recipient))
+            else:
+                unresolved.append(name)
+
+        busy: dict[str, str] = {}
+        no_data: list[str] = []
+        for label, recipient in people:
+            status = str(_safe(lambda r=recipient: r.FreeBusy(anchor, 30, True), "") or "")
+            if status:
+                busy[label] = status
+            else:
+                no_data.append(label)
+        if not busy:
+            raise OutlookUnavailableError(
+                "No free/busy data could be read for any attendee"
+                + (f"; unresolved: {', '.join(unresolved)}." if unresolved else ".")
+            )
+
+        slots = find_common_slots(
+            busy,
+            anchor.date(),
+            earliest,
+            latest,
+            duration_minutes,
+            parse_clock(work_start),
+            parse_clock(work_end),
+            parse_workdays(workdays),
+            now=datetime.now(),
+            limit=max(1, limit),
+            allow_tentative=allow_tentative,
+        )
+        return {
+            "slots": slots,
+            "checked": list(busy),
+            "no_data": no_data,
+            "unresolved": unresolved,
+            "tentative_counts_as_busy": not allow_tentative,
+        }
+
+    def create_meeting(
+        self,
+        attendees: str,
+        subject: str,
+        start: str,
+        duration_minutes: int = 30,
+        body: str = "",
+        optional_attendees: str = "",
+        location: str = "",
+        teams: bool = True,
+        send: bool = False,
+    ) -> dict[str, Any]:
+        required = split_addresses(attendees)
+        optional = split_addresses(optional_attendees)
+        begin = parse_when(start)
+        if not (required or optional):
+            raise ValueError("At least one attendee is required.")
+        if duration_minutes <= 0:
+            raise ValueError("duration_minutes must be positive.")
+
+        item = self.app.CreateItem(OL_CREATE_APPOINTMENT)
+        try:
+            item.MeetingStatus = OL_MEETING
+            item.Subject = subject
+            item.Start = begin
+            item.Duration = duration_minutes
+            if location:
+                item.Location = location
+            if body:
+                item.Body = body
+            for address in required:
+                item.Recipients.Add(address).Type = OL_REQUIRED
+            for address in optional:
+                item.Recipients.Add(address).Type = OL_OPTIONAL
+            if not item.Recipients.ResolveAll():
+                bad = [
+                    str(_safe(lambda r=r: r.Name, "") or "")
+                    for r in (item.Recipients.Item(i + 1) for i in range(item.Recipients.Count))
+                    if not _safe(lambda r=r: r.Resolved, False)
+                ]
+                raise ValueError(f"Could not resolve attendee(s): {', '.join(bad)}.")
+
+            link = ""
+            if teams:
+                link = self._teams_inserter(item)
+            if send:
+                item.Send()
+            else:
+                item.Save()
+                item.Close(OL_SAVE)
+        except Exception:
+            _safe(lambda: item.Close(OL_DISCARD))
+            raise
+
+        result: dict[str, Any] = {
+            "sent": send,
+            "subject": subject,
+            "start": begin.isoformat(timespec="minutes"),
+            "duration_minutes": duration_minutes,
+            "required": required,
+            "optional": optional,
+            "teams_link": link,
+        }
+        if send:
+            result["posted_as"] = "your own Outlook account - invitations went to the attendees"
+        else:
+            result["where"] = (
+                "Saved UNSENT in your Outlook Calendar - open it there and click Send "
+                "to invite the attendees."
+            )
+        return result
 
     def reply(
         self,

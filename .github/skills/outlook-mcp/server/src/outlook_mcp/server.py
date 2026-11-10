@@ -23,18 +23,37 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
         include_body: bool = False,
         include_quoted: bool = False,
         body_offset: int = 0,
+        body_limit: int | None = None,
+        bounded: bool = False,
     ) -> dict[str, Any]:
         message = MailMessage.from_raw(
             raw,
-            preview_chars=config.preview_chars,
+            preview_chars=min(config.preview_chars or 156, 156) if bounded else config.preview_chars,
             include_body=include_body,
-            max_body_chars=config.max_body_chars,
+            max_body_chars=config.max_body_chars if body_limit is None else body_limit,
             include_quoted=include_quoted,
             body_offset=body_offset,
         )
         # List results cap recipients; a single message shows everyone, since
         # knowing exactly who was on a mail matters when you reply to it.
-        return message.to_dict(max_recipients=0 if include_body else config.list_recipients)
+        recipients = max(1, min(config.list_recipients or 3, 10)) if bounded else (
+            0 if include_body else config.list_recipients
+        )
+        return message.to_dict(max_recipients=recipients)
+
+    def _batch_ids(entry_ids: list[str]) -> list[str]:
+        if not entry_ids or len(entry_ids) > config.max_results:
+            raise ValueError(
+                f"Supply 1 to OUTLOOK_MAX_RESULTS={config.max_results} entry IDs; "
+                "split larger batches explicitly."
+            )
+        if any(not isinstance(entry_id, str) or not entry_id.strip() for entry_id in entry_ids):
+            raise ValueError("Every entry_id must be a nonempty string.")
+        return list(dict.fromkeys(entry_id.strip() for entry_id in entry_ids))
+
+    def _batch_result(results: list[dict[str, Any]]) -> dict[str, Any]:
+        failed = sum("error" in result for result in results)
+        return {"results": results, "succeeded": len(results) - failed, "failed": failed}
 
     def _annotate(
         shaped: list[dict[str, Any]], stats: dict[str, Any], requested: int = 0
@@ -113,12 +132,17 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
         days: int = 0,
         from_contains: str = "",
         subject_contains: str = "",
+        received_after: str = "",
+        received_before: str = "",
     ) -> list[dict[str, Any]]:
         """List messages in a folder, newest first.
 
         Returns headers plus a short preview, not full bodies - call
         get_message(entry_id) for the complete text of one message. `days`
         limits the search to recent mail and makes large folders much faster.
+        received_after (inclusive) and received_before (exclusive) accept ISO
+        dates/date-times; no offset means server-local time. Use
+        list_messages_page to continue beyond the result or scan limit.
         """
         raws = client.list_raw(
             folder_path=folder,
@@ -128,8 +152,67 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
             from_contains=from_contains,
             subject_contains=subject_contains,
             stats=(stats := {}),
+            received_after=received_after,
+            received_before=received_before,
         )
         return _annotate([_shape(raw) for raw in raws], stats, requested=int(limit or 0))
+
+    @server.tool()
+    def list_messages_page(
+        folder: str = "Inbox",
+        limit: int = 25,
+        unread_only: bool = False,
+        days: int = 0,
+        from_contains: str = "",
+        subject_contains: str = "",
+        offset: int = 0,
+        received_after: str = "",
+        received_before: str = "",
+        compact: bool = True,
+    ) -> dict[str, Any]:
+        """List a bounded page with next_offset, including across empty scan pages.
+
+        Start at offset=0; keep identical filters and pass next_offset until
+        more_available is false. OUTLOOK_MAX_RESULTS caps each page, not the
+        total. ISO received_after is inclusive, received_before exclusive;
+        offset-free dates use server-local midnight, ISO offsets are converted.
+        compact returns key headers and a short preview.
+
+        Offsets index a live sorted collection, not a snapshot. Gather pages
+        before marking read; restart/deduplicate if mail arrives, moves or is
+        deleted. Prefer fixed received bounds over rolling days when paging.
+        """
+        stats: dict[str, Any] = {}
+        raws = client.list_raw(
+            folder_path=folder,
+            limit=_cap(limit),
+            unread_only=unread_only,
+            days=max(0, int(days or 0)),
+            from_contains=from_contains,
+            subject_contains=subject_contains,
+            stats=stats,
+            offset=offset,
+            received_after=received_after,
+            received_before=received_before,
+        )
+        messages = [_shape(raw, bounded=compact) for raw in raws]
+        if compact:
+            fields = {"entry_id", "subject", "from", "received", "unread", "attachments"}
+            messages = [
+                {
+                    **{key: value for key, value in message.items() if key in fields},
+                    "preview": message.get("preview", "")[:160],
+                    "preview_truncated": len(message.get("preview", "")) > 160
+                    or bool(message.get("body_truncated")),
+                }
+                for message in messages
+            ]
+        return {
+            "messages": messages,
+            "next_offset": stats.get("next_offset"),
+            "more_available": stats.get("next_offset") is not None,
+            "scanned": max(0, stats.get("scanned", offset) - offset),
+        }
 
     @server.tool()
     def get_message(
@@ -204,6 +287,61 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
             merged,
             requested=int(limit or 0),
         )
+
+    @server.tool()
+    def get_messages(
+        entry_ids: list[str],
+        include_quoted: bool = False,
+        body_offset: int = 0,
+        body_chars: int = 2000,
+    ) -> dict[str, Any]:
+        """Read an explicit batch of messages, with bounded bodies and per-ID errors.
+
+        Supply at most OUTLOOK_MAX_RESULTS IDs. Duplicates are read once.
+        body_chars is 1-10000 per message; the configured body cap and a
+        100000-character batch body budget also apply. Truncated bodies carry
+        body_next_offset for continuation via get_message. Never marks mail read.
+        """
+        ids = _batch_ids(entry_ids)
+        if not 1 <= body_chars <= 10000 or body_offset < 0:
+            raise ValueError("body_chars must be 1-10000 and body_offset must be nonnegative.")
+        body_limit = min(body_chars, 100000 // len(ids))
+        if config.max_body_chars > 0:
+            body_limit = min(body_limit, config.max_body_chars)
+        results: list[dict[str, Any]] = []
+        for entry_id in ids:
+            try:
+                results.append(_shape(
+                    client.get_raw(entry_id),
+                    include_body=True,
+                    include_quoted=include_quoted,
+                    body_offset=body_offset,
+                    body_limit=body_limit,
+                    bounded=True,
+                ))
+            except Exception as exc:
+                results.append({"entry_id": entry_id, "error": str(exc)})
+        return _batch_result(results)
+
+    @server.tool()
+    def mark_messages_read(entry_ids: list[str], read: bool = True) -> dict[str, Any]:
+        """Set read state on explicit reviewed IDs only. Requires OUTLOOK_ALLOW_WRITE.
+
+        Validates the entire batch before writes; at most OUTLOOK_MAX_RESULTS
+        IDs, duplicates handled once. Reports each saved state or failure and
+        continues after an individual failure. This is not an atomic transaction.
+        Collect all list pages before changing read state; never supplies a
+        mailbox-wide mark-all operation.
+        """
+        config.require_write()
+        ids = _batch_ids(entry_ids)
+        results: list[dict[str, Any]] = []
+        for entry_id in ids:
+            try:
+                results.append(client.mark_read(entry_id, read=read))
+            except Exception as exc:
+                results.append({"entry_id": entry_id, "error": str(exc)})
+        return _batch_result(results)
 
     @server.tool()
     def list_attachments(entry_id: str) -> list[dict[str, Any]]:
@@ -331,6 +469,81 @@ def build_server(config: OutlookConfig | None = None, client: OutlookClient | No
         if not body.strip():
             raise ValueError("body must not be empty.")
         return client.create_draft(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
+
+    @server.tool()
+    def find_free_slots(
+        attendees: str,
+        start: str,
+        end: str,
+        duration_minutes: int = 30,
+        work_start: str = "09:00",
+        work_end: str = "18:00",
+        workdays: str = "sun,mon,tue,wed,thu",
+        limit: int = 10,
+        allow_tentative: bool = False,
+        include_me: bool = True,
+    ) -> dict[str, Any]:
+        """Find times when everyone is free (Scheduling Assistant equivalent).
+
+        Read-only. Uses Exchange free/busy for you and the attendees (names or
+        addresses, separated by ';' or ','). `start`/`end` bound the search as
+        'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Only slots inside work_start..work_end
+        on `workdays` are offered, earliest first. Tentative counts as busy
+        unless allow_tentative. `no_data` lists people whose calendar could not be
+        read (they are NOT checked); `unresolved` lists names that did not
+        resolve. Tell the user about both.
+        """
+        return client.find_free_slots(
+            attendees=attendees,
+            start=start,
+            end=end,
+            duration_minutes=duration_minutes,
+            work_start=work_start,
+            work_end=work_end,
+            workdays=workdays,
+            limit=min(max(1, limit), config.max_results),
+            allow_tentative=allow_tentative,
+            include_me=include_me,
+        )
+
+    @server.tool()
+    def create_meeting(
+        attendees: str,
+        subject: str,
+        start: str,
+        duration_minutes: int = 30,
+        body: str = "",
+        optional_attendees: str = "",
+        location: str = "",
+        teams: bool = True,
+        send: bool = False,
+    ) -> dict[str, Any]:
+        """Create a meeting with attendees, optionally with a Teams link.
+
+        By default (send=False) the invite is saved UNSENT in your Outlook
+        Calendar and nobody is notified until you click Send there; this is
+        ungated like create_draft. send=True mails the invitations immediately,
+        requires OUTLOOK_ALLOW_WRITE=1, and cannot be undone - confirm the exact
+        attendees, time and subject with the user first. `start` is
+        'YYYY-MM-DD HH:MM' local time. teams=True briefly opens the invite window
+        and clicks the Teams Meeting button (needs the Teams add-in and an English
+        Outlook UI), so do not touch Outlook while it runs.
+        """
+        if send:
+            config.require_send()
+        if not subject.strip():
+            raise ValueError("subject is required.")
+        return client.create_meeting(
+            attendees=attendees,
+            subject=subject,
+            start=start,
+            duration_minutes=duration_minutes,
+            body=body,
+            optional_attendees=optional_attendees,
+            location=location,
+            teams=teams,
+            send=send,
+        )
 
     @server.tool()
     def send_mail(

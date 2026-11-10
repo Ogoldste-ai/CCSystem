@@ -1098,11 +1098,16 @@ def test_expected_tools_are_registered():
         "list_calendar_events",
         "search_contacts",
         "mark_read",
+        "mark_messages_read",
+        "get_messages",
+        "list_messages_page",
         "list_attachments",
         "save_attachments",
         "create_draft",
         "send_mail",
         "reply_to_message",
+        "find_free_slots",
+        "create_meeting",
     }
 
 
@@ -1253,6 +1258,235 @@ def test_mark_read_is_gated():
     client, config, _ = build_client(allow_write=False)
     with pytest.raises(OutlookWriteDisabledError):
         tools_of(build_server(config, client))["mark_read"]("id-1")
+
+
+def test_batch_mark_read_targets_only_explicit_ids_and_continues_after_failure():
+    client, config, app = build_client(allow_write=True)
+    tool = tools_of(build_server(config, client))["mark_messages_read"]
+    result = tool([" id-1 ", "missing", "id-1"])
+    assert result["succeeded"] == 1
+    assert result["failed"] == 1
+    assert result["results"][0] == {"entry_id": "id-1", "unread": False}
+    assert result["results"][1]["entry_id"] == "missing"
+    assert "error" in result["results"][1]
+    assert app._namespace.GetItemFromID("id-1").saved
+    assert not app._namespace.GetItemFromID("id-2").saved
+
+
+def test_batch_mark_read_is_gated_before_any_writes():
+    client, config, app = build_client()
+    with pytest.raises(OutlookWriteDisabledError):
+        tools_of(build_server(config, client))["mark_messages_read"](["id-1"])
+    assert not app._namespace.GetItemFromID("id-1").saved
+
+
+@pytest.mark.parametrize("ids", [[], ["id-1", " "], ["id-1", "id-2", "id-3"]])
+def test_batch_rejects_invalid_or_oversized_input_before_writing(ids):
+    client, config, app = build_client(allow_write=True)
+    config.max_results = 2
+    with pytest.raises(ValueError):
+        tools_of(build_server(config, client))["mark_messages_read"](ids)
+    assert not app._namespace.GetItemFromID("id-1").saved
+
+
+def test_batch_mark_read_reports_save_failure_and_keeps_processing():
+    client, config, app = build_client(allow_write=True)
+    def fail_save():
+        raise RuntimeError("save failed")
+    app._namespace.GetItemFromID("id-1").Save = fail_save
+    result = tools_of(build_server(config, client))["mark_messages_read"](
+        ["id-1", "id-2"], read=False
+    )
+    assert result["failed"] == 1
+    assert result["succeeded"] == 1
+    assert result["results"][1] == {"entry_id": "id-2", "unread": True}
+
+
+def test_batch_get_messages_bounds_bodies_and_reports_missing_ids():
+    client, config, _ = build_client()
+    config.max_body_chars = 10
+    result = tools_of(build_server(config, client))["get_messages"](
+        ["id-1", "missing", "id-2"], body_chars=100
+    )
+    assert result["succeeded"] == 2
+    assert result["failed"] == 1
+    assert result["results"][0]["body"] == "The pipeli"
+    assert result["results"][0]["body_next_offset"] == 10
+    assert "error" in result["results"][1]
+    assert result["results"][2]["entry_id"] == "id-2"
+
+
+def test_batch_get_messages_has_a_cap_even_when_single_body_cap_is_disabled():
+    client, config, _ = build_client()
+    config.max_body_chars = 0
+    tool = tools_of(build_server(config, client))["get_messages"]
+    result = tool(["id-1"], body_chars=4, body_offset=4)
+    assert result["results"][0]["body"] == "pipe"
+    assert result["results"][0]["body_next_offset"] == 8
+    with pytest.raises(ValueError):
+        tool(["id-1"], body_chars=0)
+
+
+def test_batch_mark_read_does_not_claim_success_when_save_did_not_persist():
+    client, config, app = build_client(allow_write=True)
+    item = app._namespace.GetItemFromID("id-1")
+    def discard_save():
+        item.UnRead = True
+    item.Save = discard_save
+    result = tools_of(build_server(config, client))["mark_messages_read"](["id-1"])
+    assert result["failed"] == 1
+    assert result["succeeded"] == 0
+
+
+def test_message_pages_cover_more_than_the_result_cap():
+    client, config = _folder_client([_dated(f"m{i}", f"S{i}", i) for i in range(55)])
+    tool = tools_of(build_server(config, client))["list_messages_page"]
+    first = tool(limit=50)
+    second = tool(limit=50, offset=first["next_offset"])
+    assert len(first["messages"]) == 50
+    assert first["more_available"] is True
+    assert len(second["messages"]) == 5
+    assert second["more_available"] is False
+    assert second["next_offset"] is None
+    assert len({m["entry_id"] for m in first["messages"] + second["messages"]}) == 55
+
+
+def test_message_pages_can_continue_after_an_empty_bounded_scan():
+    items = [_dated(f"m{i}", "noise", i) for i in range(205)]
+    items[-1].Subject = "match"
+    client, config = _folder_client(items)
+    tool = tools_of(build_server(config, client))["list_messages_page"]
+    first = tool(limit=1, subject_contains="match")
+    assert first["messages"] == []
+    assert first["more_available"] is True
+    assert first["next_offset"] == 200
+    second = tool(limit=1, subject_contains="match", offset=200)
+    assert [m["entry_id"] for m in second["messages"]] == ["m204"]
+    assert second["more_available"] is False
+
+
+def test_date_filtered_pages_use_exact_inclusive_lower_exclusive_upper_bounds():
+    times = [
+        datetime(2026, 11, 7, 23, 59, 59),
+        datetime(2026, 11, 8),
+        datetime(2026, 11, 8, 12, 0, 30),
+        datetime(2026, 11, 8, 12, 0, 31),
+    ]
+    client, config = _folder_client([
+        FakeMail(str(i), "subject", received=t) for i, t in enumerate(times)
+    ])
+    rows = tools_of(build_server(config, client))["list_messages_page"](
+        received_after="2026-11-08", received_before="2026-11-08T12:00:31"
+    )["messages"]
+    assert [m["entry_id"] for m in rows] == ["2", "1"]
+    legacy = tools_of(build_server(config, client))["list_messages"](
+        received_after="2026-11-08", received_before="2026-11-08T12:00:31"
+    )
+    assert [m["entry_id"] for m in legacy] == ["2", "1"]
+
+
+def test_date_filtered_pages_compare_offset_aware_received_times():
+    from datetime import timezone
+    client, config = _folder_client([
+        FakeMail("in", "subject", received=datetime(2026, 11, 8, 0, tzinfo=timezone.utc)),
+        FakeMail("out", "subject", received=datetime(2026, 11, 9, 0, tzinfo=timezone.utc)),
+    ])
+    rows = tools_of(build_server(config, client))["list_messages_page"](
+        received_after="2026-11-08T02:00:00+02:00",
+        received_before="2026-11-09T02:00:00+02:00",
+    )["messages"]
+    assert [m["entry_id"] for m in rows] == ["in"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"offset": -1},
+    {"received_after": "not-a-date"},
+    {"received_after": "2026-11-09", "received_before": "2026-11-08"},
+])
+def test_message_pages_reject_invalid_boundaries(kwargs):
+    client, config, _ = build_client()
+    with pytest.raises(ValueError):
+        tools_of(build_server(config, client))["list_messages_page"](**kwargs)
+
+
+def test_message_pages_offer_compact_output_without_changing_legacy_results():
+    client, config, _ = build_client()
+    tool = tools_of(build_server(config, client))["list_messages_page"]
+    compact = tool()["messages"][0]
+    assert "to" not in compact and "folder" not in compact
+    assert compact["entry_id"] == "id-1"
+    assert "to" in tool(compact=False)["messages"][0]
+
+
+def test_message_pages_offset_beyond_end_reports_no_negative_scan():
+    client, config, _ = build_client()
+    result = tools_of(build_server(config, client))["list_messages_page"](offset=100)
+    assert result["messages"] == []
+    assert result["more_available"] is False
+    assert result["scanned"] == 0
+
+
+def test_batch_mark_read_rejects_non_mail_without_saving():
+    client, config, app = build_client(allow_write=True)
+    item = app._namespace.GetItemFromID("id-1")
+    item.Class = 26
+    result = tools_of(build_server(config, client))["mark_messages_read"](["id-1"])
+    assert result["failed"] == 1
+    assert not item.saved
+
+
+def test_batch_get_messages_does_not_duplicate_large_bodies_in_previews():
+    items = [
+        FakeMail(str(i), "subject", body="x" * 20000, recipients=[
+            FakeRecipient(f"Person {n}", f"p{n}@example.com") for n in range(20)
+        ])
+        for i in range(11)
+    ]
+    client, config = _folder_client(items)
+    config.preview_chars = 20000
+    config.max_body_chars = 0
+    rows = tools_of(build_server(config, client))["get_messages"](
+        [str(i) for i in range(11)], body_chars=10000
+    )["results"]
+    assert sum(len(row["body"]) for row in rows) <= 100000
+    assert all(len(row["preview"]) <= 160 for row in rows)
+    assert all(len(row["to"]) == 4 for row in rows)
+    assert all(row["body_next_offset"] > 0 for row in rows)
+
+
+@pytest.mark.parametrize("tool_name", ["list_messages", "list_messages_page"])
+@pytest.mark.parametrize(("lower", "upper", "expected"), [
+    ("2026-10-24T22:45:00Z", "2026-10-24T23:15:00Z", ["second"]),
+    ("2026-10-24T23:15:00Z", "2026-10-24T23:45:00Z", ["third"]),
+])
+def test_received_filters_preserve_instants_across_repeated_local_hour(
+    monkeypatch, tool_name, lower, upper, expected
+):
+    from datetime import timezone
+    import outlook_mcp.outlook as outlook_module
+
+    class FallbackDatetime(datetime):
+        def astimezone(self, tz=None):
+            if tz is None:
+                utc = super().astimezone(timezone.utc).replace(tzinfo=None)
+                hours = 3 if utc < datetime(2026, 10, 24, 23) else 2
+                tz = timezone(timedelta(hours=hours))
+            return super().astimezone(tz)
+
+    monkeypatch.setattr(outlook_module, "datetime", FallbackDatetime)
+    client, config = _folder_client([
+        FakeMail(entry_id, "subject", received=FallbackDatetime.fromisoformat(stamp))
+        for entry_id, stamp in [
+            ("first", "2026-10-24T22:30:00Z"),
+            ("second", "2026-10-24T23:00:00Z"),
+            ("third", "2026-10-24T23:30:00Z"),
+        ]
+    ])
+    result = tools_of(build_server(config, client))[tool_name](
+        received_after=lower, received_before=upper
+    )
+    rows = result["messages"] if tool_name.endswith("_page") else result
+    assert [m["entry_id"] for m in rows] == expected
 
 
 def test_send_mail_allowed_once_enabled():

@@ -12,8 +12,9 @@ BACKENDS = (FILEDROP, GRAPH)
 
 WRITE_DISABLED_MESSAGE = (
     "Teams write operations are disabled. Set TEAMS_ALLOW_WRITE=1 in the MCP server "
-    "environment and reload the client to enable them. This guard exists because a "
-    "reply is posted under your own Microsoft Teams identity and cannot be unsent."
+    "environment and reload the client to enable them. This guard exists because a call "
+    "can create a chat or deliver an externally visible Teams message, actions that "
+    "cannot always be undone."
 )
 
 
@@ -104,7 +105,9 @@ class TeamsConfig:
             if not self.client_id:
                 issues.append(
                     "TEAMS_CLIENT_ID is not set. Register a single-tenant public-client app "
-                    "with delegated Chat.Read and use its application (client) id."
+                    "with delegated Chat.Read for chat reads, User.ReadBasic.All for "
+                    "directory search, Chat.Create for starting chats, and Chat.ReadWrite "
+                    "for replies as needed; use its application (client) id."
                 )
             if not self.tenant_id:
                 issues.append("TEAMS_TENANT_ID is not set.")

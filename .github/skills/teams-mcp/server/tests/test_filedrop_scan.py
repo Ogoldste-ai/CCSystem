@@ -361,6 +361,57 @@ def test_graph_check_response_is_unchanged(config, monkeypatch):
     assert response["new_count"] == 1 and not response["marked_seen"]
 
 
+def test_people_tools_explain_filedrop_directory_limit(config):
+    config.allow_write = True
+    server = build_server(config)
+
+    async def run():
+        with pytest.raises(ToolError, match="requires TEAMS_BACKEND=graph"):
+            await call(server, "search_people", query="gbarak")
+        with pytest.raises(ToolError, match="requires TEAMS_BACKEND=graph"):
+            await call(server, "start_chat", user_id="01234567-89ab-cdef-0123-456789abcdef")
+
+    asyncio.run(run())
+
+
+def test_people_tools_forward_to_graph_backend(config, monkeypatch):
+    from teams_mcp.backends.graph import GraphBackend
+    from teams_mcp.config import GRAPH
+
+    config.backend = GRAPH
+    config.client_id = "client"
+    config.tenant_id = "tenant"
+    config.allow_write = True
+    monkeypatch.setattr(
+        GraphBackend, "search_people", lambda self, query, limit=10: [{"id": "person-1", "query": query}]
+    )
+    monkeypatch.setattr(
+        GraphBackend, "start_chat", lambda self, user_id: {"started": True, "user_id": user_id}
+    )
+    server = build_server(config)
+
+    async def run():
+        people = await call(server, "search_people", query="gbarak")
+        chat = await call(server, "start_chat", user_id="person-1")
+        assert people == [{"id": "person-1", "query": "gbarak"}]
+        assert chat == {"started": True, "user_id": "person-1"}
+
+    asyncio.run(run())
+
+
+def test_start_chat_requires_write_permission(config):
+    from teams_mcp.config import GRAPH
+
+    config.backend = GRAPH
+    config.client_id = "client"
+    config.tenant_id = "tenant"
+    config.allow_write = False
+    server = build_server(config)
+
+    with pytest.raises(ToolError, match="Teams write operations are disabled"):
+        asyncio.run(call(server, "start_chat", user_id="01234567-89ab-cdef-0123-456789abcdef"))
+
+
 def test_stdio_transport_returns_scan_diagnostics(config):
     drop(config)
 

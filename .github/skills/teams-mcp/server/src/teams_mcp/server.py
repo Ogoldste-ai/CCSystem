@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .backends.base import MessageSource
 from .backends.filedrop import FileDropBackend
@@ -132,6 +133,31 @@ def build_server(config: TeamsConfig | None = None) -> FastMCP:
             if not scan.complete:
                 response["warning"] = scan.warning() + " No messages were marked seen."
         return response
+
+    @server.tool()
+    def search_people(query: str, limit: int = 10) -> list[dict[str, str]]:
+        """Search the Microsoft Entra directory by display name or email."""
+        if config.backend != GRAPH:
+            raise ToolError("search_people requires TEAMS_BACKEND=graph.")
+        search = getattr(backend, "search_people", None)
+        if not callable(search):
+            raise ToolError("search_people requires TEAMS_BACKEND=graph.")
+        return cast(list[dict[str, str]], search(query=query, limit=limit))
+
+    @server.tool()
+    def start_chat(user_id: str) -> dict[str, Any]:
+        """Create or retrieve a one-to-one chat with a selected directory person.
+
+        Requires TEAMS_ALLOW_WRITE=1. Confirm the selected person's identity
+        with the user before calling; creating a chat is an external action.
+        """
+        config.require_write()
+        if config.backend != GRAPH:
+            raise ToolError("start_chat requires TEAMS_BACKEND=graph.")
+        start = getattr(backend, "start_chat", None)
+        if not callable(start):
+            raise ToolError("start_chat requires TEAMS_BACKEND=graph.")
+        return cast(dict[str, Any], start(user_id=user_id))
 
     @server.tool()
     def reply_to_chat(chat_id: str, body: str) -> dict[str, Any]:

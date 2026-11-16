@@ -110,6 +110,7 @@ def test_write_guard_blocks_when_disabled(tmp_path):
     with pytest.raises(TeamsWriteDisabledError) as excinfo:
         config.require_write()
     assert "TEAMS_ALLOW_WRITE" in str(excinfo.value)
+    assert "create a chat" in str(excinfo.value)
 
 
 def test_write_guard_allows_when_enabled(tmp_path):
@@ -449,6 +450,92 @@ def test_graph_fetch_messages_requires_chat_id(tmp_path):
     backend, _ = graph_backend(tmp_path, {})
     with pytest.raises(ValueError):
         backend.fetch_messages("")
+
+
+def test_graph_search_people_uses_directory_search(tmp_path):
+    routes = {
+        ("GET", "/users"): FakeResponse(
+            200,
+            {
+                "value": [
+                    {
+                        "id": "01234567-89ab-cdef-0123-456789abcdef",
+                        "displayName": "Gal Barak",
+                        "userPrincipalName": "gbarak@nuvoton.com",
+                        "mail": "gbarak@nuvoton.com",
+                    }
+                ]
+            },
+        )
+    }
+    backend, http = graph_backend(tmp_path, routes)
+    requested_scopes = []
+    backend._acquire_token = lambda scopes: requested_scopes.extend(scopes) or "fake-token"
+
+    people = backend.search_people("gbarak", limit=7)
+
+    assert people == [
+        {
+            "id": "01234567-89ab-cdef-0123-456789abcdef",
+            "display_name": "Gal Barak",
+            "user_principal_name": "gbarak@nuvoton.com",
+            "mail": "gbarak@nuvoton.com",
+        }
+    ]
+    assert requested_scopes == ["User.ReadBasic.All"]
+    method, path, kwargs = http.calls[0]
+    assert (method, path) == ("GET", "/users")
+    assert kwargs["params"]["$search"] == '"displayName:gbarak" OR "mail:gbarak"'
+    assert kwargs["params"]["$top"] == 7
+    assert kwargs["headers"]["ConsistencyLevel"] == "eventual"
+
+
+def test_graph_search_people_rejects_empty_query_before_request(tmp_path):
+    backend, http = graph_backend(tmp_path, {})
+    with pytest.raises(ValueError, match="query must not be empty"):
+        backend.search_people("   ")
+    assert http.calls == []
+
+
+def test_graph_start_chat_creates_one_on_one_chat_with_selected_person(tmp_path):
+    user_id = "01234567-89ab-cdef-0123-456789abcdef"
+    routes = {
+        ("GET", "/me"): FakeResponse(200, {"id": "abcdef01-2345-6789-abcd-ef0123456789"}),
+        ("POST", "/chats"): FakeResponse(
+            201,
+            {
+                "id": "19:new-chat@thread.v2",
+                "chatType": "oneOnOne",
+                "members": [{"displayName": "Gal Barak"}],
+            },
+        ),
+    }
+    backend, http = graph_backend(tmp_path, routes)
+    requested_scopes = []
+    backend._acquire_token = lambda scopes: requested_scopes.extend(scopes) or "fake-token"
+
+    result = backend.start_chat(user_id)
+
+    assert result["started"] is True
+    assert result["chat_id"] == "19:new-chat@thread.v2"
+    assert result["backend"] == "graph"
+    assert requested_scopes == ["User.ReadBasic.All", "Chat.Create"]
+    method, path, kwargs = http.calls[1]
+    assert (method, path) == ("POST", "/chats")
+    payload = kwargs["json"]
+    assert payload["chatType"] == "oneOnOne"
+    members = payload["members"]
+    assert len(members) == 2
+    assert members[0]["user@odata.bind"].endswith("users('abcdef01-2345-6789-abcd-ef0123456789')")
+    assert members[1]["user@odata.bind"].endswith(f"users('{user_id}')")
+    assert all(member["roles"] == ["owner"] for member in members)
+
+
+def test_graph_start_chat_rejects_invalid_user_id_before_request(tmp_path):
+    backend, http = graph_backend(tmp_path, {})
+    with pytest.raises(ValueError, match="user_id must be a Microsoft Entra object ID"):
+        backend.start_chat("not-a-user-id")
+    assert http.calls == []
 
 
 # --------------------------------------------------------------------------

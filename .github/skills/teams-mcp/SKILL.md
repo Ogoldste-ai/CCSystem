@@ -40,7 +40,9 @@ dedicated app instead:
 
 - name `teams-mcp`, **single tenant**
 - **public client / native**, device-code flow, **no client secret**
-- Microsoft Graph **delegated** `Chat.Read` (and `Chat.ReadWrite` to reply)
+- Microsoft Graph **delegated** `Chat.Read` for chat reads, `Chat.ReadWrite`
+  for replies, `User.ReadBasic.All` for directory search, and `Chat.Create`
+  for creating one-to-one chats. Grant only the scopes for features you use.
 - **no** application/app-only permissions
 - user assignment restricted to your account
 
@@ -87,6 +89,8 @@ Read:
 - `get_message(message_id, chat_id="")`
 - `check_new_messages(limit=25, mark_seen=True)` - **the alert**; suppresses
   messages reported by complete checks; incomplete checks never consume messages
+- `search_people(query, limit=10)` - Graph-only directory search by name or email;
+  requires delegated `User.ReadBasic.All`
 
 Write - requires `TEAMS_ALLOW_WRITE`:
 
@@ -95,6 +99,9 @@ Write - requires `TEAMS_ALLOW_WRITE`:
   the webhook URL and the message arrives as the Workflows bot, not as you.
 - `reply_to_chat(chat_id, body)` - targets a specific chat from `list_chats`, so
   it needs a working read backend. On `graph` it posts under your own identity.
+- `start_chat(user_id)` - Graph-only; creates or retrieves a one-to-one chat,
+  requires `TEAMS_ALLOW_WRITE=1` and delegated `Chat.Create`. Search first and
+  confirm the selected person's identity with the user before calling.
 
 ## Fastest way to actually send a message
 

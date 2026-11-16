@@ -85,12 +85,16 @@ endpoint.
 
 `Chat.Read` currently returns **`AADSTS65001` - needs admin approval** for
 `nuvoton.com` (tenant `a3f24931-d403-4b4a-94f1-7d83ac638e07`). Not policy-blocked,
-so an admin can grant it. Any 401/403 from Graph repeats this in the error text.
+so an admin can grant it. Directory search and starting chats additionally use
+delegated `User.ReadBasic.All` and `Chat.Create`; replying uses `Chat.ReadWrite`.
+Those permissions may need separate admin approval. The shared Graph error hint lists the
+operation-to-permission mapping and admin-consent guidance for 401/403 responses.
 
 Request wording that gets approved:
 
 > Please register a single-tenant Entra application with delegated Microsoft Graph
-> permission `Chat.Read` (and `Chat.ReadWrite` if acceptable), **no**
+> permission `Chat.Read` (and `User.ReadBasic.All` for people search,
+> `Chat.Create` for starting chats, and `Chat.ReadWrite` for replies, as needed), **no**
 > application/app-only permissions, public client with device-code flow and no
 > client secret, user assignment restricted to my account. Delegated access means
 > the tool can only see chats I can already see, acting as me.

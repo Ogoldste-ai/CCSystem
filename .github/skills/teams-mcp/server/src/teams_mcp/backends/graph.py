@@ -4,6 +4,7 @@ import json
 import ssl
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import httpx
 import truststore
@@ -14,13 +15,16 @@ from ..models import Chat, Message, strip_html
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 READ_SCOPE = "Chat.Read"
 WRITE_SCOPE = "Chat.ReadWrite"
+PEOPLE_READ_SCOPE = "User.ReadBasic.All"
+CHAT_CREATE_SCOPE = "Chat.Create"
 
 CONSENT_HINT = (
-    "Microsoft Graph refused the request. Chat.Read and Chat.ReadWrite each need "
-    "administrator consent in this tenant (a user-consent attempt returns AADSTS65001). "
-    "Ask IT to register a single-tenant public-client app with delegated Chat.Read - and "
-    "Chat.ReadWrite if replying is needed - assigned to your account only, then set "
-    "TEAMS_CLIENT_ID to its application id."
+    "Microsoft Graph refused the request. The operation needs its delegated Graph "
+    "permission: Chat.Read for chat reads, User.ReadBasic.All for directory search, "
+    "Chat.Create for creating chats, or Chat.ReadWrite for replies. The permission may "
+    "need administrator consent (a user-consent attempt can return AADSTS65001); ask IT "
+    "to grant the permission. Use a single-tenant public-client "
+    "app assigned to your account only, then set TEAMS_CLIENT_ID to its application id."
 )
 
 
@@ -139,7 +143,8 @@ class GraphBackend:
 
     def _request(self, method: str, path: str, scopes: list[str], **kwargs: Any) -> Any:
         token = self._acquire_token(scopes)
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = dict(kwargs.pop("headers", {}))
+        headers["Authorization"] = f"Bearer {token}"
         response = self._client().request(method, path, headers=headers, **kwargs)
         if response.status_code >= 400:
             raise GraphApiError.from_response(method, path, response)
@@ -254,6 +259,81 @@ class GraphBackend:
             messages.append(message)
         messages.sort(key=lambda item: item.sort_key(), reverse=True)
         return messages[:limit] if limit > 0 else messages
+
+    def search_people(self, query: str, limit: int = 10) -> list[dict[str, str]]:
+        """Search the directory for people by display name or email address."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must not be empty.")
+        term = query.strip().replace("\\", "\\\\").replace('"', '\\"')
+        bounded_limit = max(1, min(int(limit), 50))
+        payload = self._request(
+            "GET",
+            "/users",
+            [PEOPLE_READ_SCOPE],
+            params={
+                "$search": f'"displayName:{term}" OR "mail:{term}"',
+                "$top": bounded_limit,
+                "$count": "true",
+                "$select": "id,displayName,userPrincipalName,mail",
+            },
+            headers={"ConsistencyLevel": "eventual"},
+        )
+        people: list[dict[str, str]] = []
+        for item in payload.get("value", []):
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            people.append(
+                {
+                    "id": str(item["id"]),
+                    "display_name": str(item.get("displayName") or ""),
+                    "user_principal_name": str(item.get("userPrincipalName") or ""),
+                    "mail": str(item.get("mail") or ""),
+                }
+            )
+        return people
+
+    def start_chat(self, user_id: str) -> dict[str, Any]:
+        """Create or retrieve a one-on-one chat with a directory user."""
+        try:
+            parsed_user_id = UUID(user_id)
+            if str(parsed_user_id) != user_id.lower():
+                raise ValueError
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("user_id must be a Microsoft Entra object ID.") from None
+
+        me = self._request("GET", "/me", [PEOPLE_READ_SCOPE])
+        my_id = str(me.get("id") or "")
+        try:
+            parsed_my_id = UUID(my_id)
+        except (TypeError, ValueError):
+            raise RuntimeError("Microsoft Graph did not return a valid signed-in user ID.") from None
+        if parsed_my_id == parsed_user_id:
+            raise ValueError("user_id must identify someone other than the signed-in user.")
+
+        payload = self._request(
+            "POST",
+            "/chats",
+            [CHAT_CREATE_SCOPE],
+            json={
+                "chatType": "oneOnOne",
+                "members": [
+                    {
+                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                        "roles": ["owner"],
+                        "user@odata.bind": f"{GRAPH_BASE}/users('{my_id}')",
+                    },
+                    {
+                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                        "roles": ["owner"],
+                        "user@odata.bind": f"{GRAPH_BASE}/users('{user_id}')",
+                    },
+                ],
+            },
+        )
+        chat_id = str(payload.get("id") or "")
+        if not chat_id:
+            raise RuntimeError("Microsoft Graph created no chat ID in its response.")
+        return {"started": True, "chat_id": chat_id, "backend": self.name}
 
     # -- writes --------------------------------------------------------------
 

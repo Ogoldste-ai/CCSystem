@@ -97,9 +97,22 @@ list_merge_requests(author_username="<me>", state="all")
 list_merge_requests(reviewer_username="<me>", state="all")
 ```
 
-`health()` returns the current username. Report MRs opened, merged and
-reviewed. Note any still blocked on review or a red pipeline — that is the
-kind of thing a status mail exists to surface.
+`health()` returns the current username. Inspect MR details, source branches,
+notes/discussions, approvals, and pipeline history for the reporting window.
+Count an MR as reviewed only when an approval or review comment/action by the
+user is evidenced in that window; reviewer assignment alone is not proof.
+Preserve the exact source branch name returned by GitLab.
+
+For every MR the user reviewed during the window, collect its title/IID and
+source branch. Also collect each MR pipeline or test run from the window, with
+its source branch and actual `passed`/`failed` outcome. Use pipeline timestamps
+and status, not the MR's current status alone. Do not claim the user triggered
+a run unless the available evidence identifies them; otherwise describe it as
+an MR pipeline result or ask the user to confirm. If run history or branch
+identity is unavailable, state that coverage gap rather than guessing. Include
+these results in a required `Git Update` section in the report. Separately
+flag currently open MRs blocked on review, conflicts, unresolved discussions,
+or a failing pipeline.
 
 **Teams** (best effort):
 
@@ -120,6 +133,13 @@ covered** — just leave it out.
   reporting-period line such as `Weekly - WW<n> (<start date>-<end date>)`.
   Include a vacation/absence line only when supported by the gathered sources
   or supplied by the user; bold the dates and reason as in the reference.
+- Include a `Git Update` work-area heading every week, even when there were no
+  qualifying items (say `No updates`). List reviewed MRs with title/IID and
+  exact source branch, plus each MR pipeline/test run from the period with
+  exact source branch and `passed`/`failed` outcome. Attribute a run to the
+  user only when confirmed; otherwise report it as an MR pipeline result or
+  ask for confirmation. Do not substitute current pipeline status for a run
+  that occurred during the reporting period.
 - Use filled-disc bullets for work-area headings and nested hollow-circle
   bullets for their items. The reference orders the areas as `BMC and Tavor
   SVB`, `Validation infrastructure`, `I3C`, then `Booter`. Keep relevant areas

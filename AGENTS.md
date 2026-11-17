@@ -126,6 +126,27 @@ git add copilot-marketplace   # or ec_accurev_git
 git commit -m "Bump <submodule> to latest"
 ```
 
+## Keep changes simple and focused On any code update
+
+- Implement only the requested behavior, with the smallest reasonable change
+  to the existing flow. Prefer clear, direct code over clever or compact code.
+- Reuse existing functions, helpers, scripts and execution paths before
+  introducing new files, classes, wrappers or abstractions.
+- Do not build a general-purpose framework, configurable pipeline or lifecycle
+  system for a single use case or hypothetical future requirements.
+- Keep the execution flow easy to follow from the entry point to the result.
+  A short main function is not a justification for spreading complexity across
+  many supporting files and classes.
+- Before adding files, classes or architectural layers not already agreed,
+  explain why existing code is insufficient and show the simpler alternative.
+  Obtain approval before proceeding. Apply the same rule before broadening
+  shared-code behavior or affecting unrelated modules.
+- Keep unrelated cleanup, renaming, file moves and formatting out of the
+  requested change. Propose them separately.
+- Preserve existing behavior, public entry points, automated test coverage and
+  necessary safety checks. Reduce unnecessary machinery, not required error
+  handling, resource ownership or bounded waits.
+
 ## Code writing rules (C/C++)
 
 - Do not add unit tests unless explicitly requested by the user.

@@ -12,6 +12,7 @@ repo so it can be versioned independently.
                     shared-module-convert-test-and-parm/
                     weekly-mail/  (weekly WW status mail drafter)
                     hebrew-pdf-text-edit/  (edit text inside Hebrew PDFs)
+                    Shared_Anthropics_code_simplifier/  (simplify recently modified code)
 .github/agents/   (reserved) custom agent definitions
 ec_accurev_git/   git submodule → firmware repo (added separately)
 ```

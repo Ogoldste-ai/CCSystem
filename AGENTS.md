@@ -146,6 +146,11 @@ git commit -m "Bump <submodule> to latest"
 - Preserve existing behavior, public entry points, automated test coverage and
   necessary safety checks. Reduce unnecessary machinery, not required error
   handling, resource ownership or bounded waits.
+- After implementing or modifying code, and before
+  `verification-before-completion` or any build/test verification, invoke the
+  `Shared_Anthropics_code_simplifier` skill on the changed code only. This
+  applies inside every skill/superpowers workflow too. It must preserve
+  behavior exactly and never authorizes a commit or push.
 
 ## Code writing rules (C/C++)
 

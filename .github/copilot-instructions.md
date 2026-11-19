@@ -37,6 +37,7 @@ repo that matches its purpose:
                     shared-module-convert-test-and-parm/
                     weekly-mail/  (weekly WW status mail drafter)
                     hebrew-pdf-text-edit/  (edit text inside Hebrew PDFs)
+                    Shared_Anthropics_code_simplifier/  (simplify recently modified code)
                     local-building-bmc-modules/  (bounded BMC builds and incremental-cache recovery)
                     _group-template/  (template for bundling many skills into
                                        one plugin; see its README)

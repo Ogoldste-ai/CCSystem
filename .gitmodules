@@ -7,3 +7,6 @@
 [submodule "pdftomd-rag"]
 	path = pdftomd-rag
 	url = git@github-nuvoton:nuvoton-IS00/pdftomd-rag.git
+[submodule "EC_ACCUREV_GIT_AGENTS"]
+	path = EC_ACCUREV_GIT_AGENTS
+	url = git@github-nuvoton:nuvoton-IS00/EC_ACCUREV_GIT_AGENTS.git

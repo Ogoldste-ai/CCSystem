@@ -23,21 +23,27 @@ Trigger phrase: "Shared_human_approve_of_changes" / "human approve changes"
 
 2. **Confirm the build.** Identify the existing project-specific build workflow.
    For BMC, invoke `local-building-bmc-modules` and follow its checks and
-   repository task runner. Its normal **Clean + Rebuild** satisfies this step:
-   do not add `ClearArtifacts`, delete `.vs`, or invoke the artifact-clearing
-   skill. Disclose and obtain approval for any configuration-specific extra
+   repository task runner. When present, use the CCSystem checkout's
+   `.github\skills\local-building-bmc-modules\SKILL.md` for the current guidance.
+   Its normal incremental build satisfies this step:
+   do not add `ClearArtifacts` up front, delete `.vs`, or invoke the
+   artifact-clearing skill. `ClearArtifacts` belongs only to the build
+   skill's approved `objs.txt` link-failure recovery. Disclose and obtain
+   approval for any configuration-specific extra
    cleanup, including `A35_Release`. For EC/TPM, use a verified existing
    project-specific skill/workflow; if unavailable, stop and explain the gap.
    Never substitute BMC commands. Show the resolved checkout, module,
    configuration, commands and write/delete effects; obtain build approval.
 
-3. **Clean and build.** Run only the approved workflow. Check its exit status,
+3. **Build.** Run only the approved workflow. Check its exit status,
    complete summary and expected fresh outputs according to the build skill.
-   Inspect post-build Git status for generated changes. On any failure or
-   missing evidence, stop before review/publication and report the blocker.
-   Do not silently retry, expand cleanup or fix unrelated failures.
-   On success, report: "Clean + Rebuild passed; ready for testing.
-   Runtime tests were not run." Do not launch Host.exe, remote jobs or hardware.
+   Inspect post-build Git status for generated changes. On a full pass, report:
+   "Build passed; ready for testing. Runtime tests were not run." For a
+   host-only BMC change that meets the build skill's non-blocking `objs.txt`
+   exception, report the verified host build and the nonzero solution exit,
+   then proceed to code review without claiming full build or runtime readiness.
+   Otherwise, stop on failure or missing evidence. Do not silently retry,
+   expand cleanup, fix unrelated failures, or launch Host.exe, remote jobs or hardware.
 
 4. **Open human review.** Invoke `shared_review_changes`; follow its repository
    selection and side-by-side diff workflow. Confirm the reviewed repository
@@ -80,7 +86,7 @@ confirmed target. Follow the build skill's preflight and output checks.
 pwsh.exe -NoProfile -Command 'Set-Location "C:\CCSystem\ec_accurev_git"; & ".\BMC\.vscode\BmcModuleTask.ps1" -Action BuildModuleConfiguration -WorkspaceFolder (Resolve-Path ".\BMC").Path -Module BMC_template -Configuration Release; exit $LASTEXITCODE'
 ```
 
-Runs BMC's existing Clean + Rebuild task and propagates its exit status.
+Runs BMC's existing incremental build task and propagates its exit status.
 This is not an EC/TPM build command.
 
 ```bash

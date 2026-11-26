@@ -11,6 +11,8 @@
 /* Coding Standards general notes:																			*/
 /*	- Make sure the editor you are using, is configured to 4 spaces per Tab.								*/
 /*	  Otherwise, this code will not be properly viewed.														*/
+/*	- In ec_accurev_git, use LogError, LogWarning, LogMessage, or related logging APIs for diagnostics.		*/
+/*	  Do not use std::fprintf or write diagnostics directly to stdout or stderr.								*/
 /*----------------------------------------------------------------------------------------------------------*/
 
 #include <stdio.h>							// Standard "C" libraries should be placed first
